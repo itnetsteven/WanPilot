@@ -1,0 +1,15 @@
+#!/bin/sh
+set -eu
+for name in wan wan1; do
+  output=$(ubus call "network.interface.$name" status 2>/dev/null) || { echo "STATUS_UNAVAILABLE:$name" >&2; exit 2; }
+  up=$(printf '%s\n' "$output" | jsonfilter -e '@.up' 2>/dev/null) || exit 2
+  dev=$(printf '%s\n' "$output" | jsonfilter -e '@.l3_device' 2>/dev/null) || exit 2
+  [ "$up" = true ] || { echo "OFFLINE:$name" >&2; exit 3; }
+  case "$dev" in ''|*[!a-zA-Z0-9_.:@-]*) echo "BAD_DEVICE:$name" >&2; exit 4;; esac
+  healthy=0
+  for dest in 1.1.1.1 8.8.8.8; do
+    if ping -4 -I "$dev" -c 1 -W 2 "$dest" >/dev/null 2>&1; then healthy=1; break; fi
+  done
+  [ "$healthy" -eq 1 ] || { echo "PROBE_FAILED:$name" >&2; exit 5; }
+done
+printf 'wan=reachable\nwan1=reachable\n'
