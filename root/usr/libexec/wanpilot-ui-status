@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+BASE=/etc/wanpilot/v11
+/usr/libexec/wanpilot-safe status
+if [ -f "$BASE/pending" ] && [ -f "$BASE/token" ]; then
+  tok="$(cat "$BASE/token")"
+  start="${tok%%-*}"
+  case "$start" in
+    ''|*[!0-9]*) echo 'deadline_epoch=unknown';;
+    *) echo "deadline_epoch=$((start + 120))";;
+  esac
+fi
