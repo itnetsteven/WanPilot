@@ -1,0 +1,159 @@
+#!/bin/sh
+set -eu
+
+# WanPilot emergency recovery backend.
+# Production defaults use /etc/config/mwan3. Tests MUST set WANPILOT_RECOVERY_TEST_ROOT.
+if [ -n "${WANPILOT_RECOVERY_TEST_ROOT:-}" ]; then
+  ROOT="$WANPILOT_RECOVERY_TEST_ROOT"
+  LIVE="$ROOT/etc/config/mwan3"
+  BASE="$ROOT/etc/wanpilot/recovery"
+  SHARED_LOCK="$ROOT/var/lock/wanpilot-shared-mwan3.lock"
+  LOCK="$ROOT/var/lock/wanpilot-recovery.lock"
+  DEVICE_PENDING="$ROOT/etc/wanpilot/v11/pending"
+  GLOBAL_PENDING="$ROOT/etc/wanpilot/global-safe-v19/pending"
+  MWAN3_RESTART="${WANPILOT_TEST_RESTART_CMD:-:}"
+else
+  LIVE=/etc/config/mwan3
+  BASE=/etc/wanpilot/recovery
+  SHARED_LOCK=/var/lock/wanpilot-shared-mwan3.lock
+  LOCK=/var/lock/wanpilot-recovery.lock
+  DEVICE_PENDING=/etc/wanpilot/v11/pending
+  GLOBAL_PENDING=/etc/wanpilot/global-safe-v19/pending
+  MWAN3_RESTART=/etc/init.d/mwan3
+fi
+SNAPS="$BASE/snapshots"
+CURRENT="$BASE/current"
+LAST_RESULT="$BASE/last-result"
+
+umask 077
+say(){ printf '%s\n' "$*"; }
+die(){ printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+sha(){ sha256sum "$1" | awk '{print $1}'; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
+
+check_tools(){
+  for c in flock sha256sum awk cp mv mkdir date cat grep chmod; do need "$c"; done
+  [ -f "$LIVE" ] || die "mwan3 config missing: $LIVE"
+}
+
+valid_id(){ printf '%s' "$1" | grep -Eq '^[0-9]{8}T[0-9]{6}-[0-9]+$'; }
+current_id(){
+  [ -f "$CURRENT" ] || return 1
+  id="$(cat "$CURRENT" 2>/dev/null || true)"
+  valid_id "$id" || die 'invalid recovery current pointer'
+  printf '%s\n' "$id"
+}
+
+snapshot_dir(){
+  id="$1"; valid_id "$id" || die 'invalid snapshot id'
+  printf '%s/%s\n' "$SNAPS" "$id"
+}
+
+uci_clean(){
+  if [ -n "${WANPILOT_RECOVERY_TEST_ROOT:-}" ]; then
+    [ ! -e "$ROOT/test-uci-dirty" ]
+  else
+    [ -z "$(uci -q changes mwan3)" ] && [ -z "$(uci -q changes wanpilot)" ]
+  fi
+}
+
+pending_any(){ [ -e "$DEVICE_PENDING" ] || [ -e "$GLOBAL_PENDING" ]; }
+
+capture(){
+  case "${1:-pre-apply}" in device-pre-apply|global-pre-apply|device-save-apply|global-save-apply|pre-apply|test) ;; *) die 'invalid recovery reason';; esac
+  check_tools
+  uci_clean || die 'pending UCI edits; recovery snapshot capture refused'
+  pending_any && die 'another protected WanPilot application is pending'
+
+  mkdir -p "$SNAPS" "$(dirname "$SHARED_LOCK")"
+  chmod 700 "$BASE" "$SNAPS" 2>/dev/null || true
+  id="$(date +%Y%m%dT%H%M%S)-$$"
+  dir="$SNAPS/$id"
+  tmpcur="$BASE/current.tmp.$$"
+  mkdir "$dir"
+  chmod 700 "$dir"
+  cp "$LIVE" "$dir/mwan3"
+  chmod 600 "$dir/mwan3"
+  sha "$dir/mwan3" > "$dir/mwan3.sha"
+  date -u +%Y-%m-%dT%H:%M:%SZ > "$dir/created_at"
+  printf '%s\n' "${1:-pre-apply}" > "$dir/reason"
+  [ "$(sha "$dir/mwan3")" = "$(cat "$dir/mwan3.sha")" ] || die 'snapshot verification failed'
+  printf '%s\n' "$id" > "$tmpcur"
+  chmod 600 "$tmpcur"
+  mv "$tmpcur" "$CURRENT"
+  printf 'captured=%s\n' "$id"
+  printf 'snapshot_sha=%s\n' "$(cat "$dir/mwan3.sha")"
+}
+
+status(){
+  check_tools
+  live_sha="$(sha "$LIVE")"
+  say "live_sha=$live_sha"
+  if uci_clean; then say 'uci_clean=yes'; else say 'uci_clean=no'; fi
+  if [ -e "$DEVICE_PENDING" ]; then say 'device_pending=yes'; else say 'device_pending=no'; fi
+  if [ -e "$GLOBAL_PENDING" ]; then say 'global_pending=yes'; else say 'global_pending=no'; fi
+  if id="$(current_id 2>/dev/null)"; then
+    dir="$(snapshot_dir "$id")"
+    [ -f "$dir/mwan3" ] && [ -f "$dir/mwan3.sha" ] || die 'current recovery snapshot incomplete'
+    stored="$(cat "$dir/mwan3.sha")"
+    actual="$(sha "$dir/mwan3")"
+    say 'snapshot_exists=yes'
+    say "snapshot_id=$id"
+    say "snapshot_sha=$stored"
+    [ -f "$dir/created_at" ] && say "created_at=$(cat "$dir/created_at")"
+    [ -f "$dir/reason" ] && say "reason=$(cat "$dir/reason")"
+    if [ "$stored" = "$actual" ]; then say 'snapshot_integrity=ok'; else say 'snapshot_integrity=BAD'; fi
+    if [ "$live_sha" = "$stored" ]; then say 'live_matches_snapshot=yes'; else say 'live_matches_snapshot=no'; fi
+  else
+    say 'snapshot_exists=no'
+  fi
+  if [ -f "$LAST_RESULT" ]; then say "last_result=$(cat "$LAST_RESULT")"; fi
+}
+
+restart_mwan3(){
+  if [ -n "${WANPILOT_RECOVERY_TEST_ROOT:-}" ]; then
+    sh -c "$MWAN3_RESTART"
+  else
+    "$MWAN3_RESTART" restart
+  fi
+}
+
+restore(){
+  check_tools
+  uci_clean || die 'pending UCI edits; refusing emergency restore to avoid overwriting editor changes'
+  pending_any && die 'protected WanPilot application still pending; use its own rollback first or wait for it to finish'
+  id="$(current_id)" || die 'no recovery snapshot available'
+  dir="$(snapshot_dir "$id")"
+  [ -f "$dir/mwan3" ] && [ -f "$dir/mwan3.sha" ] || die 'recovery snapshot incomplete'
+  stored="$(cat "$dir/mwan3.sha")"
+  [ "$(sha "$dir/mwan3")" = "$stored" ] || die 'recovery snapshot hash mismatch'
+
+  live_sha="$(sha "$LIVE")"
+  if [ "$live_sha" = "$stored" ]; then
+    printf '%s\n' "already_restored:$id" > "$LAST_RESULT"
+    say 'RESTORE NO-OP: live mwan3 already matches the saved pre-apply snapshot'
+    return 0
+  fi
+
+  tmp="$LIVE.wanpilot-recovery.$$"
+  cp "$dir/mwan3" "$tmp"
+  chmod 600 "$tmp"
+  [ "$(sha "$tmp")" = "$stored" ] || { rm -f "$tmp"; die 'temporary restore copy verification failed'; }
+  mv "$tmp" "$LIVE"
+  if ! restart_mwan3; then
+    printf '%s\n' "restart_failed:$id" > "$LAST_RESULT"
+    die 'snapshot restored but mwan3 restart failed; inspect locally before further changes'
+  fi
+  [ "$(sha "$LIVE")" = "$stored" ] || die 'post-restore hash verification failed'
+  printf '%s\n' "restored:$id" > "$LAST_RESULT"
+  say "RESTORE PASS: restored snapshot $id and restarted mwan3"
+}
+
+# Ensure lock file parent exists before shell opens lock descriptors.
+mkdir -p "$(dirname "$SHARED_LOCK")" "$(dirname "$LOCK")"
+case "${1:-status}" in
+  status) (flock -s 8; flock -s 9; status) 8>"$SHARED_LOCK" 9>"$LOCK" ;;
+  capture) (flock -x 8; flock -x 9; capture "${2:-pre-apply}") 8>"$SHARED_LOCK" 9>"$LOCK" ;;
+  restore) (flock -x 8; flock -x 9; restore) 8>"$SHARED_LOCK" 9>"$LOCK" ;;
+  *) die 'usage: wanpilot-recovery {status|capture [reason]|restore}' ;;
+esac
