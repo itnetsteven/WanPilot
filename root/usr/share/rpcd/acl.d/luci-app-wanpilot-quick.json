@@ -1,0 +1,7 @@
+{
+  "luci-app-wanpilot-quick": {
+    "description": "WanPilot read-only quick confirmation gate",
+    "read": {"file": {"/usr/libexec/wanpilot-quick-guard": ["exec"],"/usr/libexec/wanpilot-link-health": ["exec"]}},
+    "write": {"file": {"/usr/libexec/wanpilot-quick-guard": ["exec"]}}
+  }
+}
