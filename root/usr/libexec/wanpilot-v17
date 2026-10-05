@@ -1,0 +1,34 @@
+#!/bin/sh
+# V1.7: saves only a planning target in wanpilot; reads counters without changing network.
+set -e
+op="${1:-}"
+case "$op" in
+ save-target)
+  p="${2:-}"
+  case "$p" in ''|*[!0-9]*) echo 'ERROR: integer required' >&2; exit 2;; esac
+  [ "$p" -ge 5 ] && [ "$p" -le 95 ] && [ $((p % 5)) -eq 0 ] || { echo 'ERROR: 5..95 step 5' >&2; exit 2; }
+  [ ! -e /etc/wanpilot/v11/pending ] || { echo 'ERROR: application pending' >&2; exit 1; }
+  [ -z "$(uci -q changes wanpilot)" ] || { echo 'ERROR: save form changes first' >&2; exit 1; }
+  [ "$(uci -q get wanpilot.main)" = settings ] || { echo 'ERROR: settings section missing' >&2; exit 1; }
+  mkdir -p /etc/wanpilot/upgrade-backups
+  cp /etc/config/wanpilot "/etc/wanpilot/upgrade-backups/wanpilot-v17-$(date +%Y%m%d-%H%M%S).bak"
+  uci set "wanpilot.main.global_wan_pct=$p"
+  uci commit wanpilot
+  [ "$(uci -q get wanpilot.main.global_wan_pct)" = "$p" ] || exit 1
+  echo "SAVED global target WAN=$p WAN1=$((100-p)); live mwan3 UNCHANGED. This target is not applied by current engine."
+  ;;
+ hits)
+  command -v mwan3 >/dev/null || { echo 'ERROR: mwan3 missing' >&2; exit 1; }
+  echo 'Device rule counters (packets bytes policy src destination):'
+  mwan3 status | awk '
+    /^Active ipv4 user rules:/ { active=1; next }
+    /^Active ipv6 user rules:/ { active=0 }
+    active && $1 ~ /^[0-9]+$/ && $2 ~ /^[0-9]+$/ && $4 ~ /^wpx_p_/ {
+      printf "packets=%s bytes=%s policy=%s src=%s dst=%s\n",$1,$2,$4,$9,$10; found=1
+    }
+    END {if(!found)print "No active WanPilot rule counters found. Rules may be unapplied or no matching rows."}
+  '
+  echo 'Note: counters do not by themselves prove the actual public egress IP.'
+  ;;
+ *) echo 'ERROR: unsupported operation' >&2; exit 2;;
+esac
