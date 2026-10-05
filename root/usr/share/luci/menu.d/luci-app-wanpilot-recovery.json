@@ -1,0 +1,8 @@
+{
+  "admin/network/wanpilot-recovery": {
+    "title": "WanPilot 应急恢复",
+    "order": 66,
+    "action": { "type": "view", "path": "wanpilot/recovery" },
+    "depends": { "acl": ["luci-app-wanpilot-recovery"] }
+  }
+}
