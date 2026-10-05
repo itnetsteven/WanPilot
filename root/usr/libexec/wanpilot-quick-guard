@@ -1,0 +1,25 @@
+#!/bin/sh
+set -eu
+kind=${1:-}
+requested_sha=${2:-}
+case "$requested_sha" in
+  *[!0-9a-f]*|"") echo "INVALID_EXPECTED_SHA" >&2; exit 12;;
+esac
+[ "${#requested_sha}" -eq 64 ] || { echo "INVALID_EXPECTED_SHA" >&2; exit 12; }
+case "$kind" in device) backend=/usr/libexec/wanpilot-safe; other=/usr/libexec/wanpilot-global-safe;; global) backend=/usr/libexec/wanpilot-global-safe; other=/usr/libexec/wanpilot-safe;; *) echo 'INVALID_KIND' >&2; exit 2;; esac
+[ -x "$backend" ] && [ -x "$other" ] || { echo 'BACKEND_MISSING' >&2; exit 3; }
+[ -z "$(uci -q changes mwan3)" ] && [ -z "$(uci -q changes wanpilot)" ] || { echo 'UCI_DIRTY' >&2; exit 4; }
+a=$($backend status) || { echo 'PRIMARY_STATUS_FAILED' >&2; exit 5; }
+b=$($other status) || { echo 'OTHER_STATUS_FAILED' >&2; exit 6; }
+field() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -n 1; }
+[ "$(field "$a" pending)" = yes ] && [ "$(field "$b" pending)" = no ] || { echo 'PENDING_MISMATCH' >&2; exit 7; }
+[ "$(field "$a" watchdog)" = process_present ] || { echo 'WATCHDOG_UNAVAILABLE' >&2; exit 8; }
+expected=$(field "$a" candidate_sha)
+actual=$(field "$a" live_sha)
+[ -n "$expected" ] && [ "$expected" = "$requested_sha" ] && [ "$expected" = "$actual" ] || { echo 'CANDIDATE_MISMATCH' >&2; exit 9; }
+if [ "$kind" = device ]; then
+  s=$(field "$a" wanpilot_snapshot_sha); t=$(field "$a" wanpilot_live_sha)
+  [ -n "$s" ] && [ "$s" = "$t" ] || { echo 'RULES_MISMATCH' >&2; exit 10; }
+fi
+/usr/libexec/wanpilot-link-health || { echo 'EGRESS_HEALTH_FAILED' >&2; exit 11; }
+echo "eligible=$kind candidate_sha=$requested_sha"
