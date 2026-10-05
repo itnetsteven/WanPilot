@@ -1,0 +1,61 @@
+#!/bin/sh
+set -e
+fail() { echo "ERROR: $*" >&2; exit 1; }
+[ "$(id -u)" = 0 ] || fail 'root required'
+[ ! -e /etc/wanpilot/v11/pending ] || fail 'safe application pending'
+[ -z "$(uci -q changes mwan3)" ] || fail 'mwan3 has unsaved edits'
+[ -z "$(uci -q changes wanpilot)" ] || fail 'wanpilot has unsaved edits'
+[ -f /etc/config/mwan3 ] && [ -f /etc/config/wanpilot ] || fail 'missing configurations'
+percent="$(uci -q get wanpilot.main.global_wan_pct || echo '')"
+case "$percent" in ''|*[!0-9]*) fail 'global target is not set';; esac
+[ "$percent" -ge 5 ] && [ "$percent" -le 95 ] && [ $((percent % 5)) -eq 0 ] || fail 'invalid target'
+[ "$(uci -q get mwan3.balanced)" = policy ] || fail 'balanced policy missing'
+primary="$(uci -q get wanpilot.dualwan.primary || :)"
+secondary="$(uci -q get wanpilot.dualwan.secondary || :)"
+[ -n "$primary" ] && [ -n "$secondary" ] || fail 'WanPilot WAN interfaces are not initialized'
+[ "$(uci -q get mwan3.$primary)" = interface ] && [ "$(uci -q get mwan3.$secondary)" = interface ] || fail 'detected WAN interfaces missing from mwan3'
+root=/tmp/wanpilot-v18-preview
+[ ! -L "$root" ] || fail 'unsafe preview directory'
+mkdir -p "$root"; chmod 700 "$root"
+source_cfg=/etc/config/mwan3
+origsha="$(sha256sum /etc/config/mwan3 | awk '{print $1}')"
+source_sha="$(sha256sum /etc/config/wanpilot | awk '{print $1}')"
+mkdir -p "$root/config" "$root/delta"; rm -f "$root/delta"/*
+cp "$source_cfg" "$root/config/mwan3"; chmod 600 "$root/config/mwan3"
+u() { command uci -c "$root/config" -p "$root/delta" "$@"; }
+[ -z "$(u -q show mwan3 | grep '^mwan3\.wpx_global_' || :)" ] || fail 'global preview section name collision'
+old_members="$(u -q get mwan3.balanced.use_member || :)"
+[ -n "$old_members" ] || fail 'balanced has no configured members'
+u set 'mwan3.wpx_global_wan=member'
+u set "mwan3.wpx_global_wan.interface=$primary"
+u set 'mwan3.wpx_global_wan.metric=1'
+u set "mwan3.wpx_global_wan.weight=$percent"
+u set 'mwan3.wpx_global_wan1=member'
+u set "mwan3.wpx_global_wan1.interface=$secondary"
+u set 'mwan3.wpx_global_wan1.metric=1'
+u set "mwan3.wpx_global_wan1.weight=$((100-percent))"
+u delete mwan3.balanced.use_member
+u add_list 'mwan3.balanced.use_member=wpx_global_wan'
+u add_list 'mwan3.balanced.use_member=wpx_global_wan1'
+u commit mwan3
+[ "$(u -q get mwan3.balanced.use_member)" = 'wpx_global_wan wpx_global_wan1' ] || fail 'candidate balanced membership mismatch'
+[ "$(u -q get mwan3.wpx_global_wan.weight)" = "$percent" ] || fail 'WAN weight mismatch'
+[ "$(u -q get mwan3.wpx_global_wan1.weight)" = "$((100-percent))" ] || fail 'WAN1 weight mismatch'
+command uci -c /etc/config -p "$root/delta" show mwan3 | grep -v '^mwan3\.balanced\.use_member=' | LC_ALL=C sort > "$root/original.fields"
+u show mwan3 | grep -v '^mwan3\.balanced\.use_member=' | LC_ALL=C sort > "$root/candidate.fields"
+awk 'NR==FNR{a[$0]++; next} {if(a[$0]>0)a[$0]--;else{print "MISSING ORIGINAL FIELD:",$0;bad=1}} END {exit bad}' "$root/candidate.fields" "$root/original.fields" || fail 'existing fields changed'
+[ "$(sha256sum /etc/config/mwan3 | awk '{print $1}')" = "$origsha" ] || fail 'live mwan3 changed'
+[ "$(sha256sum /etc/config/wanpilot | awk '{print $1}')" = "$source_sha" ] || fail 'WanPilot changed while previewing'
+printf '%s\n' "$origsha" > "$root/original.sha"
+printf '%s\n' "$source_sha" > "$root/wanpilot.sha"
+cat <<RESULT
+GLOBAL PREVIEW PASS: isolated candidate generated; live mwan3 unchanged.
+Running balanced members: $old_members
+Proposed balanced: $primary $percent% / $secondary $((100-percent))% (connection weights)
+Original SHA256: $origsha
+Candidate SHA256: $(sha256sum "$root/config/mwan3" | awk '{print $1}')
+Original UCI fields preserved except balanced.use_member (intended change).
+Existing installed device policies and prior rules preserved.
+IMPORTANT: this candidate is not used by the current safe application engine.
+No mwan3 reload and no real network change.
+RESULT
