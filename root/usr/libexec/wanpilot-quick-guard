@@ -1,4 +1,5 @@
 #!/bin/sh
+# Read-only eligibility gate. Does not apply, confirm or restart networking.
 set -eu
 kind=${1:-}
 requested_sha=${2:-}
@@ -21,5 +22,7 @@ if [ "$kind" = device ]; then
   s=$(field "$a" wanpilot_snapshot_sha); t=$(field "$a" wanpilot_live_sha)
   [ -n "$s" ] && [ "$s" = "$t" ] || { echo 'RULES_MISMATCH' >&2; exit 10; }
 fi
+# A healthy config hash does not prove an egress path works. Require both physical
+# WAN interfaces to pass independent bound-IP reachability checks before auto-confirm.
 /usr/libexec/wanpilot-link-health || { echo 'EGRESS_HEALTH_FAILED' >&2; exit 11; }
 echo "eligible=$kind candidate_sha=$requested_sha"

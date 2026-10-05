@@ -46,6 +46,9 @@ loaded=$(printf '%s\n' "$status" | awk '
  /^Active ipv6 user rules:/ {active=0}
  active && / - wpx_p_/ && !/^[[:space:]]*$/ {n++}
  END{print n+0}')
+# Only verify confirmed device snapshot when reported by that engine; a later GLOBAL
+# operation may legitimately change the live configuration without changing device rules.
+# Never mistake historical backend SHA fields for current authoritative state.
 printf 'CURRENT WAN=%s%% WAN1=%s%%\n' "$running_wan" "$running_wan1"
 printf 'TARGET WAN=%s%% WAN1=%s%%\n' "$target" "$((100-target))"
 printf 'RULES configured=%s running_managed=%s\n' "$configured" "$loaded"

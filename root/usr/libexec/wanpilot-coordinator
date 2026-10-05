@@ -1,4 +1,5 @@
 #!/bin/sh
+# Read-only LuCI eligibility check. Does not authorize or execute network changes.
 set -u
 [ "$#" -eq 1 ] && [ "$1" = inspect ] || { echo 'usage: wanpilot-coordinator inspect' >&2; exit 2; }
 say() { printf '%s=%s\n' "$1" "$2"; }
@@ -12,6 +13,7 @@ for backend in /usr/libexec/wanpilot-safe /usr/libexec/wanpilot-global-safe; do
   case "$state" in
     confirmed|idle|committed|rolled_back) :;;
     restored)
+      # A finished rollback is idle only if its original config is still live.
       original_sha=$(printf '%s\n' "$output" | sed -n 's/^original_sha=//p' | head -n1)
       live_sha=$(printf '%s\n' "$output" | sed -n 's/^live_sha=//p' | head -n1)
       [ -n "$original_sha" ] && [ "$original_sha" = "$live_sha" ] || block blocked_unknown restored_hash_mismatch
