@@ -1,0 +1,7 @@
+config profile 'dualwan'
+	option name 'dualwan'
+	option primary 'wan'
+	option secondary 'wan1'
+	option mode 'balance'
+	option weight_primary '1'
+	option weight_secondary '1'
