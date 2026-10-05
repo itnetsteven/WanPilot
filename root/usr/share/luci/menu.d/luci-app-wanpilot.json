@@ -1,0 +1,8 @@
+{
+ "admin/network/wanpilot": {
+  "title": "WAN 策略中心",
+  "order": 65,
+  "action": { "type": "view", "path": "wanpilot/overview" },
+  "depends": { "acl": ["luci-app-wanpilot"] }
+ }
+}
