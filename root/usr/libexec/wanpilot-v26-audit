@@ -1,0 +1,55 @@
+#!/bin/sh
+# WanPilot 2.6: read-only safety gate and drift report; NEVER modifies mwan3.
+set -eu
+fail() { printf 'BLOCKED: %s\n' "$1"; exit 1; }
+getstate() {
+  name="$1"; path="$2"
+  [ -x "$path" ] || fail "$name backend missing"
+  result=$("$path" status 2>&1) || fail "$name status unavailable: $result"
+  pending=$(printf '%s\n' "$result" | sed -n 's/^pending=//p' | head -n 1)
+  state=$(printf '%s\n' "$result" | sed -n 's/^state=//p' | head -n 1)
+  case "$pending" in yes|no) :;; *) fail "$name pending status invalid";; esac
+  [ -n "$state" ] || fail "$name state missing"
+  printf '%s STATE=%s PENDING=%s\n' "$name" "$state" "$pending"
+  [ "$pending" = no ] || fail "$name has pending confirmation"
+}
+command -v uci >/dev/null 2>&1 || fail 'uci missing'
+command -v mwan3 >/dev/null 2>&1 || fail 'mwan3 missing'
+command -v sha256sum >/dev/null 2>&1 || fail 'sha256sum missing'
+[ -f /etc/config/mwan3 ] || fail 'mwan3 config missing'
+[ -f /etc/config/wanpilot ] || fail 'wanpilot config missing'
+getstate DEVICE /usr/libexec/wanpilot-safe
+getstate GLOBAL /usr/libexec/wanpilot-global-safe
+[ -z "$(uci -q changes mwan3)" ] || fail 'mwan3 has uncommitted UCI changes'
+[ -z "$(uci -q changes wanpilot)" ] || fail 'wanpilot has uncommitted UCI changes'
+actual=$(sha256sum /etc/config/mwan3 | awk '{print $1}')
+status=$(mwan3 status) || fail 'mwan3 status query failed'
+parsed=$(printf '%s\n' "$status" | awk '
+ /^Current ipv4 policies:/ { section=1; next }
+ /^Current ipv6 policies:/ { section=0 }
+ section && /^balanced:/ { bal=1; next }
+ section && bal && /^[^[:space:]]/ {exit}
+ section && bal && /^[[:space:]]*wan1[[:space:]]*\([0-9]+%\)/ {x=$0;sub(/^[^(]*\(/,"",x);sub(/%.*/,"",x);b=x}
+ section && bal && /^[[:space:]]*wan[[:space:]]*\([0-9]+%\)/ {x=$0;sub(/^[^(]*\(/,"",x);sub(/%.*/,"",x);a=x}
+ END { if(a!="" && b!="") printf "%s %s",a,b }
+')
+[ -n "$parsed" ] || fail 'cannot parse live IPv4 balanced weights'
+set -- $parsed
+running_wan=$1; running_wan1=$2
+[ "$((running_wan + running_wan1))" -eq 100 ] || fail 'live balanced weights do not total 100%'
+target=$(uci -q get wanpilot.main.global_wan_pct || true)
+case "$target" in ''|*[!0-9]*) fail 'saved global WAN target invalid';; esac
+[ "$target" -ge 5 ] && [ "$target" -le 95 ] || fail 'saved target outside supported 5..95'
+configured=$(uci -q show wanpilot | awk '/=rule$/ {n++} END{print n+0}')
+loaded=$(printf '%s\n' "$status" | awk '
+ /^Active ipv4 user rules:/ {active=1;next}
+ /^Active ipv6 user rules:/ {active=0}
+ active && / - wpx_p_/ && !/^[[:space:]]*$/ {n++}
+ END{print n+0}')
+printf 'CURRENT WAN=%s%% WAN1=%s%%\n' "$running_wan" "$running_wan1"
+printf 'TARGET WAN=%s%% WAN1=%s%%\n' "$target" "$((100-target))"
+printf 'RULES configured=%s running_managed=%s\n' "$configured" "$loaded"
+printf 'LIVE_SHA256=%s\n' "$actual"
+printf 'STATUS: no pending task; UCI clean; runtime policy available\n'
+echo 'READY FOR PREVIEW: this is not authorization to apply; use existing safety check immediately before applying.'
+echo 'READ ONLY: no network changes.'
