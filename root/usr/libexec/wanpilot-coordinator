@@ -1,0 +1,27 @@
+#!/bin/sh
+set -u
+[ "$#" -eq 1 ] && [ "$1" = inspect ] || { echo 'usage: wanpilot-coordinator inspect' >&2; exit 2; }
+say() { printf '%s=%s\n' "$1" "$2"; }
+block() { say verdict "$1"; say reason "$2"; exit 0; }
+for backend in /usr/libexec/wanpilot-safe /usr/libexec/wanpilot-global-safe; do
+  [ -x "$backend" ] || block blocked_unknown missing_backend
+  output=$("$backend" status 2>/dev/null) || block blocked_unknown status_failed
+  state=$(printf '%s\n' "$output" | sed -n 's/^state=//p' | head -n1)
+  pending=$(printf '%s\n' "$output" | sed -n 's/^pending=//p' | head -n1)
+  case "$pending" in no) :;; yes) block blocked_pending pending_transaction;; *) block blocked_unknown invalid_status;; esac
+  case "$state" in
+    confirmed|idle|committed|rolled_back) :;;
+    restored)
+      original_sha=$(printf '%s\n' "$output" | sed -n 's/^original_sha=//p' | head -n1)
+      live_sha=$(printf '%s\n' "$output" | sed -n 's/^live_sha=//p' | head -n1)
+      [ -n "$original_sha" ] && [ "$original_sha" = "$live_sha" ] || block blocked_unknown restored_hash_mismatch
+      ;;
+    *) block blocked_unknown invalid_state;;
+  esac
+done
+for cfg in mwan3 wanpilot; do
+  changes=$(uci -q changes "$cfg" 2>/dev/null) || block blocked_unknown uci_failed
+  [ -z "$changes" ] || block blocked_uci staged_changes
+done
+say verdict idle
+say reason no_pending_transactions
