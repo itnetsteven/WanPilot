@@ -1,0 +1,177 @@
+#!/bin/sh
+# WanPilot V1.9 protected global balanced candidate manager. Never apply on install.
+set -e
+BASE=/etc/wanpilot/global-safe-v19
+SHARED_LOCK=/var/lock/wanpilot-shared-mwan3.lock
+LOCK=/var/lock/wanpilot-global-v19.lock
+LIVE=/etc/config/mwan3
+GUARD=$BASE/pending
+TOKEN=$BASE/token
+STATE=$BASE/state
+BACKUP=$BASE/mwan3.original
+CANDIDATE=$BASE/mwan3.candidate
+READY=$BASE/ready
+PID=$BASE/watchdog.pid
+LOG=$BASE/recovery.log
+SOURCE=/etc/config/wanpilot
+SOURCE_SHA=$BASE/wanpilot.sha
+STAGER=/usr/libexec/wanpilot-global-preview
+STAGED=/tmp/wanpilot-v18-preview/config/mwan3
+mkdir -p "$BASE" /var/lock
+chmod 700 "$BASE"
+sha() { sha256sum "$1" | awk '{print $1}'; }
+die() { echo "ERROR: $*" >&2; exit 1; }
+locked() { flock -x 8 || die 'Cannot obtain shared mwan3 lock'; flock -x 9 || die 'Cannot obtain application lock'; }
+check_tools() {
+ for cmd in flock sha256sum nohup uci awk cp mv; do command -v "$cmd" >/dev/null 2>&1 || die "Missing command: $cmd"; done
+ [ -x /etc/init.d/mwan3 ] || die 'mwan3 service not present'
+ [ -x "$STAGER" ] || die 'Stage generator not installed'
+ [ -f "$LIVE" ] || die 'mwan3 config missing'
+ [ "$(uci -q get wanpilot.main.enabled)" = 0 ] || die 'Keep legacy write permission disabled'
+ [ -z "$(uci -q changes mwan3)" ] || die 'Pending mwan3 UCI edits'
+ [ -z "$(uci -q changes wanpilot)" ] || die 'Pending WanPilot UCI edits'
+ [ ! -f /etc/wanpilot/pending ] || die 'Legacy WanPilot change pending'
+ [ ! -e /etc/wanpilot/v11/pending ] || die 'Device policy application pending'
+ [ -z "$(uci -q show mwan3 | grep '^mwan3\.wpx_global_' || :)" ] || die 'Global managed sections already present; refuse overwrite'
+}
+check_candidate() {
+ [ -f "$CANDIDATE" ] && [ -f "$BACKUP" ] || die 'Missing candidate or backup'
+ [ -f "$SOURCE_SHA" ] && [ -f "$SOURCE" ] || die 'WanPilot configuration fingerprint missing'
+ [ ! -e /etc/wanpilot/v11/pending ] || die 'Device application in progress'
+ [ "$(sha "$SOURCE")" = "$(cat "$SOURCE_SHA")" ] || die 'WanPilot rules changed since readiness check; run check again'
+ [ "$(sha "$LIVE")" = "$(sha "$BACKUP")" ] || die 'Live mwan3 changed after snapshot'
+ [ "$(sha "$CANDIDATE")" = "$(cat "$BASE/candidate.sha")" ] || die 'Candidate modified after stage'
+ [ "$(sha "$BACKUP")" = "$(cat "$BASE/original.sha")" ] || die 'Backup modified after stage'
+ [ "$(uci -c "$BASE/config" -p "$BASE/delta" -q get mwan3.balanced.use_member)" = 'wpx_global_wan wpx_global_wan1' ] || die 'Balanced members do not match planned change'
+ pct="$(uci -q get wanpilot.main.global_wan_pct || :)"
+ case "$pct" in ''|*[!0-9]*) die 'Invalid global percentage';; esac
+ [ "$(uci -c "$BASE/config" -p "$BASE/delta" -q get mwan3.wpx_global_wan.weight)" = "$pct" ] || die 'WAN weight differs from target'
+ [ "$(uci -c "$BASE/config" -p "$BASE/delta" -q get mwan3.wpx_global_wan1.weight)" = "$((100-pct))" ] || die 'WAN1 weight differs from target'
+ [ "$(sha "$CANDIDATE")" != "$(sha "$BACKUP")" ] || die 'Candidate identical to current configuration' 
+}
+check() {
+ locked
+ [ ! -e "$GUARD" ] || die 'An application is awaiting confirmation'
+ check_tools
+ "$STAGER" || die 'Candidate generation failed'
+ [ -f "$STAGED" ] || die 'Staged candidate absent'
+ live_before="$(sha "$LIVE")"
+ source_before="$(sha "$SOURCE")"
+ [ -f /tmp/wanpilot-v18-preview/original.fields ] || die 'Missing global preview audit output'
+ cp "$LIVE" "$BASE/original.new"
+ cp "$STAGED" "$BASE/candidate.new"
+ chmod 600 "$BASE/original.new" "$BASE/candidate.new"
+ [ "$live_before" = "$(sha "$LIVE")" ] || die 'Live config changed during snapshot'
+ [ "$source_before" = "$(sha "$SOURCE")" ] || die 'WanPilot rules changed during snapshot'
+ mv "$BASE/original.new" "$BACKUP"
+ mv "$BASE/candidate.new" "$CANDIDATE"
+ sha "$BACKUP" > "$BASE/original.sha"
+ sha "$CANDIDATE" > "$BASE/candidate.sha"
+ echo "$source_before" > "$SOURCE_SHA"
+ mkdir -p "$BASE/delta" "$BASE/config"
+ cp "$CANDIDATE" "$BASE/config/mwan3"
+ check_candidate
+ printf 'GLOBAL READY PASS: candidate and original verified; balanced WAN %s%% / WAN1 %s%%.\n' "$pct" "$((100-pct))"
+ echo "Original SHA256: $(cat "$BASE/original.sha")"
+ echo "Candidate SHA256: $(cat "$BASE/candidate.sha")"
+ echo "WanPilot SHA256: $(cat "$SOURCE_SHA")"
+ echo 'No mwan3 changes or service restarts.'
+}
+restore_locked() {
+ [ -f "$BACKUP" ] && [ -f "$BASE/original.sha" ] || { echo 'RESTORE ERROR: backup missing' >> "$LOG"; echo restore_failed_backup > "$STATE"; return 1; }
+ [ "$(sha "$BACKUP")" = "$(cat "$BASE/original.sha")" ] || { echo 'RESTORE ERROR: backup SHA mismatch' >> "$LOG"; echo restore_failed_backup_hash > "$STATE"; return 1; }
+ cp "$BACKUP" "$LIVE.recover.$$" || { echo restore_failed_copy > "$STATE"; return 1; }
+ chmod 600 "$LIVE.recover.$$"
+ mv "$LIVE.recover.$$" "$LIVE" || { echo restore_failed_move > "$STATE"; return 1; }
+ uci -q revert mwan3 || :
+ result=0
+ /etc/init.d/mwan3 restart >> "$LOG" 2>&1 || result=1
+ [ "$(sha "$LIVE")" = "$(cat "$BASE/original.sha")" ] || result=1
+ if [ "$result" -eq 0 ]; then
+    rm -f "$GUARD" "$TOKEN"
+    echo restored > "$STATE"
+    echo 'RESTORE VERIFIED: original config hash matched and mwan3 restarted' >> "$LOG"
+ else
+    echo restore_failed_service_or_hash > "$STATE"
+    echo 'ALERT: restored file, but service/hash validation failed' >> "$LOG"
+    return 1
+ fi
+}
+watchdog() {
+ tok="$2"
+ echo "$tok" > "$READY"
+ sleep 120
+ ( locked
+   [ -f "$GUARD" ] || exit 0
+   [ -f "$TOKEN" ] || exit 0
+   [ "$(cat "$TOKEN")" = "$tok" ] || exit 0
+   restore_locked >> "$LOG" 2>&1 || :
+ ) 8>"$SHARED_LOCK" 9>"$LOCK"
+}
+apply() {
+ locked
+ [ ! -f "$GUARD" ] || die 'Application pending'
+ [ ! -e /etc/wanpilot/v11/pending ] || die 'Device application pending'
+ check_tools
+ check_candidate
+ [ -z "$(uci -q changes mwan3)" ] || die 'Pending mwan3 UCI edits'
+ [ -z "$(uci -q changes wanpilot)" ] || die 'Pending WanPilot UCI edits'
+ rm -f "$READY"
+ tok="$(date +%s)-$$"
+ echo "$tok" > "$TOKEN"
+ : > "$GUARD"
+ echo arming > "$STATE"
+ nohup /bin/sh "$0" watchdog "$tok" </dev/null >> "$LOG" 2>&1 8>&- 9>&- &
+ echo "$!" > "$PID"
+ ok=0
+ i=0
+ while [ "$i" -lt 6 ]; do
+   if [ -f "$READY" ] && [ "$(cat "$READY")" = "$tok" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then ok=1; break; fi
+   i=$((i+1)); sleep 1
+ done
+ if [ "$ok" -ne 1 ]; then rm -f "$GUARD" "$TOKEN"; echo arming_failed > "$STATE"; die 'Watchdog not ready; live config unchanged'; fi
+ [ "$(sha "$LIVE")" = "$(cat "$BASE/original.sha")" ] || die 'Live config changed; watchdog will restore backup'
+ if [ "$(sha "$SOURCE")" != "$(cat "$SOURCE_SHA")" ]; then
+   rm -f "$GUARD" "$TOKEN"
+   echo arming_cancelled_source_changed > "$STATE"
+   die 'WanPilot rules changed during watchdog arming; no live write'
+ fi
+ echo pending > "$STATE"
+ cp "$CANDIDATE" "$LIVE.install.$$" || die 'copy failed; watchdog armed'
+ chmod 600 "$LIVE.install.$$"
+ mv "$LIVE.install.$$" "$LIVE" || die 'move failed; watchdog armed'
+ uci -q revert mwan3 || :
+ if ! /etc/init.d/mwan3 restart >> "$LOG" 2>&1; then echo pending_restart_failed > "$STATE"; die 'mwan3 restart failed; watchdog remains armed'; fi
+ echo 'PENDING: confirm within 120 seconds or automatic restore'
+}
+confirm() {
+ locked
+ [ -f "$GUARD" ] || die 'No pending application'
+ [ "$(sha "$LIVE")" = "$(cat "$BASE/candidate.sha")" ] || die 'Live candidate changed; cannot confirm'
+ kill -0 "$(cat "$PID")" 2>/dev/null || die 'Watchdog unavailable; cannot confirm'
+ rm -f "$GUARD" "$TOKEN"
+ echo confirmed > "$STATE"
+ echo 'CONFIRMED: candidate retained'
+}
+rollback() { locked; [ -f "$GUARD" ] || die 'No pending application'; restore_locked; cat "$STATE"; }
+status() {
+ echo "state=$(cat "$STATE" 2>/dev/null || echo never_started)"
+ if [ -f "$GUARD" ]; then
+   echo 'pending=yes'
+   if [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; then echo 'watchdog=process_present'; else echo 'watchdog=NOT_RUNNING'; fi
+ else echo 'pending=no'; fi
+ if [ -f "$BASE/original.sha" ]; then echo "original_sha=$(cat "$BASE/original.sha")"; fi
+ if [ -f "$BASE/candidate.sha" ]; then echo "candidate_sha=$(cat "$BASE/candidate.sha")"; fi
+ echo "live_sha=$(sha "$LIVE")"
+ if [ -f "$SOURCE_SHA" ]; then echo "wanpilot_snapshot_sha=$(cat "$SOURCE_SHA")"; echo "wanpilot_live_sha=$(sha "$SOURCE")"; fi
+ [ ! -f "$LOG" ] || tail -n 8 "$LOG"
+}
+case "${1:-}" in
+ check) (check) 8>"$SHARED_LOCK" 9>"$LOCK";;
+ status) (locked; status) 8>"$SHARED_LOCK" 9>"$LOCK";;
+ watchdog) watchdog "$@";;
+ apply) (apply) 8>"$SHARED_LOCK" 9>"$LOCK";;
+ confirm) (confirm) 8>"$SHARED_LOCK" 9>"$LOCK";;
+ rollback) (rollback) 8>"$SHARED_LOCK" 9>"$LOCK";;
+ *) echo 'WanPilot V1.9 global safe: use check or status'; exit 2;;
+esac
