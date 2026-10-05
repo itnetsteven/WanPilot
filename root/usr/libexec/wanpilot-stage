@@ -1,0 +1,204 @@
+#!/bin/sh
+# WanPilot device backend integration candidate. No live mwan3 write / no service reload.
+set -e
+BASE=/tmp/wanpilot-v10-stage
+STAGE="$BASE/config"
+DELTA="$BASE/delta"
+ORIGINAL=/etc/config/mwan3
+[ "$(id -u)" = 0 ] || { echo 'ERROR: root is required'; exit 1; }
+[ -f "$ORIGINAL" ] && [ -r /etc/config/wanpilot ] || { echo 'ERROR: required config absent'; exit 1; }
+[ -z "$(command uci -q changes mwan3)" ] || { echo 'ERROR: mwan3 has pending edits'; exit 1; }
+[ -z "$(command uci -q changes wanpilot)" ] || { echo 'ERROR: wanpilot has pending edits'; exit 1; }
+[ ! -e /etc/wanpilot/pending ] || { echo 'ERROR: existing application pending'; exit 1; }
+[ ! -e /etc/wanpilot/v11/pending ] || { echo 'ERROR: device application pending'; exit 1; }
+[ ! -e /etc/wanpilot/global-safe-v19/pending ] || { echo 'ERROR: global application pending'; exit 1; }
+[ ! -L "$BASE" ] || { echo "ERROR: stage directory is symlink"; exit 1; }
+mkdir -p "$BASE" "$BASE/orig-delta"
+rm -f "$BASE/orig-delta/mwan3"
+chmod 700 "$BASE"
+rm -rf "$STAGE" "$DELTA"
+mkdir -p "$STAGE" "$DELTA"
+mkdir -p "$BASE/original-config"
+cp "$ORIGINAL" "$BASE/original-config/mwan3"
+cp "$ORIGINAL" "$STAGE/mwan3"
+cp /etc/config/wanpilot "$STAGE/wanpilot"
+chmod 600 "$STAGE/mwan3" "$STAGE/wanpilot"
+pre_sha="$(sha256sum "$ORIGINAL" | awk '{print $1}')"
+source_sha="$(sha256sum /etc/config/wanpilot | awk '{print $1}')"
+real_changes_before="$(command uci -q changes mwan3)"
+[ -z "$real_changes_before" ] || { echo 'ERROR: live UCI delta not clean before staging' >&2; exit 1; } 
+uci() { command uci -c "$STAGE" -P "$DELTA" "$@"; }
+: "${IPKG_INSTROOT:=}"
+export IPKG_INSTROOT
+. /lib/functions.sh
+PREFIX=wpx_
+err() { echo "ERROR: $*" >&2; exit 1; }
+valid_id() { echo "$1" | grep -Eq '^[A-Za-z][A-Za-z0-9_]{0,9}$'; }
+valid_iface() { echo "$1" | grep -Eq '^[A-Za-z0-9_]{1,15}$'; }
+valid_weight() { case "$1" in ''|*[!0-9]*) return 1;; esac; [ "$1" -ge 1 ] && [ "$1" -le 100 ]; }
+interfaces_exist() { [ "$(uci -q get "mwan3.$1")" = interface ] || err "unknown WAN $1"; }
+check_profile() {
+  config_get name "$1" name ''; config_get primary "$1" primary ''; config_get secondary "$1" secondary ''
+  config_get mode "$1" mode ''; config_get wp "$1" weight_primary 1; config_get ws "$1" weight_secondary 1
+  valid_id "$name" || err "invalid profile $name"
+  interfaces_exist "$primary"
+  case "$mode" in single|balance|failover) :;; *) err "invalid mode $mode";; esac
+  valid_weight "$wp" || err 'invalid weight'
+  if [ "$mode" != single ]; then
+    interfaces_exist "$secondary"; [ "$primary" != "$secondary" ] || err 'same WAN twice'
+    valid_weight "$ws" || err 'invalid secondary weight'
+  fi
+  case " $profiles " in *" $name "*) err 'duplicate profile';; esac
+  profiles="$profiles $name"
+}
+check_rule() {
+  config_get enabled "$1" enabled 1; [ "$enabled" = 1 ] || return 0
+  config_get name "$1" name ''; config_get profile "$1" profile ''
+  config_get src "$1" src_ip ''; config_get dst "$1" dest_ip ''; config_get port "$1" dest_port ''
+  config_get proto "$1" proto all
+  valid_id "$name" || err "invalid rule $name"
+  case " $rules_seen " in *" $name "*) err 'duplicate rule';; esac
+  rules_seen="$rules_seen $name"
+  case " $profiles " in *" $profile "*) :;; *) err 'missing referenced profile';; esac
+  [ -n "$src$dst$port" ] || err 'empty match would match all traffic'
+  case "$proto" in all|tcp|udp|tcpudp|icmp) :;; *) err 'invalid protocol';; esac
+  [ -z "$src" ] || printf '%s
+' "$src" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/(3[0-2]|[12]?[0-9]))?$' || err 'invalid src'
+  [ -z "$dst" ] || printf '%s
+' "$dst" | grep -Eq '^[0-9a-fA-F.:/]+$' || err 'invalid dst'
+  [ -z "$port" ] || { printf '%s
+' "$port" | grep -Eq '^[0-9,:-]+$' || err 'invalid port'; }
+  [ -z "$port" ] || { case "$proto" in tcp|udp|tcpudp) :;; *) err 'port requires TCP/UDP';; esac; }
+}
+make_profile() {
+  config_get name "$1" name; config_get primary "$1" primary
+  config_get secondary "$1" secondary ''; config_get mode "$1" mode
+  config_get wp "$1" weight_primary 1; config_get ws "$1" weight_secondary 1
+  policy="wpx_p_$name"; a="wpx_a_$name"; b="wpx_b_$name"
+  uci set "mwan3.$a=member"; uci set "mwan3.$a.interface=$primary"; uci set "mwan3.$a.metric=1"; uci set "mwan3.$a.weight=$wp"
+  uci set "mwan3.$policy=policy"; uci set "mwan3.$policy.last_resort=unreachable"
+  uci add_list "mwan3.$policy.use_member=$a"
+  if [ "$mode" != single ]; then
+    metric=2; [ "$mode" != balance ] || metric=1
+    uci set "mwan3.$b=member"; uci set "mwan3.$b.interface=$secondary"; uci set "mwan3.$b.metric=$metric"; uci set "mwan3.$b.weight=$ws"
+    uci add_list "mwan3.$policy.use_member=$b"
+  fi
+}
+make_rule() {
+  config_get enabled "$1" enabled 1; [ "$enabled" = 1 ] || return 0
+  config_get name "$1" name; config_get profile "$1" profile
+  config_get src "$1" src_ip ''; config_get dst "$1" dest_ip ''; config_get port "$1" dest_port ''
+  config_get proto "$1" proto all
+  id="wpx_r_$name"
+  uci set "mwan3.$id=rule"; uci set "mwan3.$id.use_policy=wpx_p_$profile"
+  [ -z "$src" ] || uci set "mwan3.$id.src_ip=$src"
+  [ -z "$dst" ] || uci set "mwan3.$id.dest_ip=$dst"
+  [ -z "$port" ] || uci set "mwan3.$id.dest_port=$port"
+  [ "$proto" != tcpudp ] || proto='tcp udp'
+  uci set "mwan3.$id.proto=$proto"
+  generated="$generated $id"
+}
+config_load wanpilot
+profiles=''; rules_seen=''; generated=''
+config_foreach check_profile profile
+[ -n "$profiles" ] || err 'no profiles'
+config_foreach check_rule rule
+allowed=''
+allow_profile() {
+  config_get n "$1" name ''
+  allowed="$allowed wpx_p_$n wpx_a_$n wpx_b_$n"
+}
+allow_rule() {
+  config_get en "$1" enabled 1
+  config_get n "$1" name ''
+  [ -n "$n" ] && allowed="$allowed wpx_r_$n"
+  return 0
+}
+config_foreach allow_profile profile
+config_foreach allow_rule rule
+old_sections="$(uci show mwan3 | sed -n 's/^mwan3\.\(wpx_[A-Za-z0-9_]*\)=[a-z]*$/\1/p')"
+for section in $old_sections; do
+  case "$section" in
+    wpx_global_*) continue ;;
+    wpx_r_*)
+      [ "$(uci -q get "mwan3.$section")" = rule ] || err "unexpected managed type $section"
+      old_policy="$(uci -q get "mwan3.$section.use_policy" || :)"
+      case "$old_policy" in wpx_p_*) :;; *) err "unrecognized rule policy for $section";; esac
+      uci delete "mwan3.$section" ;;
+    wpx_p_*)
+      [ "$(uci -q get "mwan3.$section")" = policy ] || err "unexpected managed type $section"
+      for member in $(uci -q get "mwan3.$section.use_member" || :); do
+        case "$member" in wpx_a_*|wpx_b_*) :;; *) err "unrecognized member in $section";; esac
+      done
+      uci delete "mwan3.$section" ;;
+    wpx_a_*|wpx_b_*)
+      [ "$(uci -q get "mwan3.$section")" = member ] || err "unexpected managed type $section"
+      profile_name="${section#wpx_?_}"
+      old_policy="wpx_p_$profile_name"
+      case " $allowed " in
+        *" $section "*) : ;;
+        *)
+          [ "$(command uci -c "$BASE/original-config" -P "$BASE/orig-delta" -q get "mwan3.$old_policy")" = policy ] || err "unknown managed section $section: manual audit required"
+          case " $(command uci -c "$BASE/original-config" -P "$BASE/orig-delta" -q get "mwan3.$old_policy.use_member" || :) " in
+            *" $section "*) :;;
+            *) err "unknown managed section $section: manual audit required";;
+          esac ;;
+      esac
+      uci delete "mwan3.$section" ;;
+    *) err "unknown reserved section $section" ;;
+  esac
+done
+config_foreach make_profile profile
+config_foreach make_rule rule
+for id in $generated; do
+  position="$(uci -q show mwan3 | awk -F'[.=]' -v target=default_rule_v4 '/^mwan3\.[A-Za-z0-9_]+=[A-Za-z0-9_]+$/ {if ($2==target){print n;exit} n++}')"
+  [ -n "$position" ] || err 'missing default IPv4 rule'
+  uci reorder "mwan3.$id=$position"
+done
+uci show mwan3 > "$BASE/expected-effective.uci"
+uci export mwan3 > "$BASE/exported.uci" || err 'isolated UCI export failed'
+sed '/^package mwan3$/d' "$BASE/exported.uci" > "$BASE/candidate.persisted.new"
+[ -s "$BASE/candidate.persisted.new" ] || err 'empty persisted candidate'
+mkdir -p "$BASE/verify-persisted/config" "$BASE/verify-persisted/delta"
+cp "$BASE/candidate.persisted.new" "$BASE/verify-persisted/config/mwan3"
+command uci -c "$BASE/verify-persisted/config" -P "$BASE/verify-persisted/delta" show mwan3 > "$BASE/reloaded.uci" || err 'exported candidate cannot be reloaded'
+cmp -s "$BASE/expected-effective.uci" "$BASE/reloaded.uci" || err 'candidate persistence mismatch: overlay differs from reloaded file'
+[ -z "$(command uci -c "$BASE/verify-persisted/config" -P "$BASE/verify-persisted/delta" -q changes mwan3)" ] || err 'persisted candidate has pending delta'
+command uci -c "$BASE/original-config" -P "$BASE/orig-delta" show mwan3 > "$BASE/original-effective.uci"
+if cmp -s "$BASE/original-effective.uci" "$BASE/reloaded.uci"; then
+  cp "$ORIGINAL" "$STAGE/mwan3"
+else
+  mv "$BASE/candidate.persisted.new" "$STAGE/mwan3"
+fi
+uci() { command uci -c "$BASE/verify-persisted/config" -P "$BASE/verify-persisted/delta" "$@"; }
+command uci -c "$BASE/original-config" -P "$BASE/orig-delta" show mwan3 > "$BASE/original.uci"
+uci show mwan3 > "$BASE/candidate.uci"
+sed '/^mwan3\.wpx_[abpr]_[A-Za-z0-9_]*[.=]/d' "$BASE/original.uci" | LC_ALL=C sort > "$BASE/original.preserved"
+sed '/^mwan3\.wpx_[abpr]_[A-Za-z0-9_]*[.=]/d' "$BASE/candidate.uci" | LC_ALL=C sort > "$BASE/candidate.preserved"
+cmp -s "$BASE/original.preserved" "$BASE/candidate.preserved" || err 'preserved UCI fields differ'
+for id in $generated; do
+  rulepos="$(uci show mwan3 | awk -F'[.=]' -v target="$id" '/^mwan3\.[A-Za-z0-9_]+=[A-Za-z0-9_]+$/ {if ($2==target){print n;exit} n++}')"
+  defaultpos="$(uci show mwan3 | awk -F'[.=]' '/^mwan3\.[A-Za-z0-9_]+=[A-Za-z0-9_]+$/ {if ($2=="default_rule_v4"){print n;exit} n++}')"
+  [ -n "$rulepos" ] && [ -n "$defaultpos" ] && [ "$rulepos" -lt "$defaultpos" ] || err "bad priority for $id"
+done
+: > "$BASE/expected-rules"
+for id in $generated; do printf '%s
+' "$id" >> "$BASE/expected-rules"; done
+sed -n 's/^mwan3\.\(wpx_r_[A-Za-z0-9_]*\)=rule$/\1/p' "$BASE/candidate.uci" > "$BASE/actual-rules"
+LC_ALL=C sort "$BASE/expected-rules" > "$BASE/expected-rules.sorted"
+LC_ALL=C sort "$BASE/actual-rules" > "$BASE/actual-rules.sorted"
+cmp -s "$BASE/expected-rules.sorted" "$BASE/actual-rules.sorted" || err 'generated device rules do not match persisted candidate'
+mkdir -p "$BASE/final-check-delta"
+command uci -c "$STAGE" -P "$BASE/final-check-delta" show mwan3 > "$BASE/final-check.uci" || err 'final candidate cannot be reloaded'
+cmp -s "$BASE/reloaded.uci" "$BASE/final-check.uci" || err 'final candidate differs from generated effective UCI view'
+post_sha="$(sha256sum "$ORIGINAL" | awk '{print $1}')"
+[ -z "$(command uci -q changes mwan3)" ] || err 'live UCI delta modified during staging' 
+[ "$pre_sha" = "$post_sha" ] || err 'LIVE MWAN3 CHANGED DURING STAGE'
+[ "$source_sha" = "$(sha256sum /etc/config/wanpilot | awk '{print $1}')" ] || err 'WANPILOT SOURCE CHANGED DURING STAGE'
+[ -z "$(command uci -q changes wanpilot)" ] || err 'WANPILOT UCI DELTA CHANGED DURING STAGE'
+echo 'STAGE PASS: isolated multi-profile candidate built; original mwan3 unchanged.'
+echo "Profiles: $(echo "$profiles" | wc -w | tr -d ' ') ; Enabled rules: $(echo "$generated" | wc -w | tr -d ' ')"
+echo 'All non-device UCI fields preserved; managed device rules precede IPv4 default.'
+echo "Original SHA256: $pre_sha"
+echo "Candidate SHA256: $(sha256sum "$STAGE/mwan3" | awk '{print $1}')"
+echo 'No service restart; no live network changes.'
