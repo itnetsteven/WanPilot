@@ -73,7 +73,7 @@ Failover 策略生成已经完成配置级验证；当前版本尚未完成正�
 
 ```sh
 opkg update
-opkg install /tmp/luci-app-wanpilot_1.2.5-3_all.ipk
+opkg install /tmp/luci-app-wanpilot_1.2.5_all.ipk
 ```
 
 安装完成后刷新 LuCI 页面，WanPilot 会出现在“网络”相关菜单中。
@@ -171,7 +171,7 @@ Download the latest IPK release and copy it to the router, then run:
 
 ```sh
 opkg update
-opkg install /tmp/luci-app-wanpilot_1.2.5-3_all.ipk
+opkg install /tmp/luci-app-wanpilot_1.2.5_all.ipk
 ```
 
 After installation, refresh LuCI in the browser. WanPilot appears under the Network section.
