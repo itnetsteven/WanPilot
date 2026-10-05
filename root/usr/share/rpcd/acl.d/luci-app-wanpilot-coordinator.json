@@ -1,0 +1,6 @@
+{
+  "luci-app-wanpilot-coordinator": {
+    "description": "WanPilot read-only apply eligibility",
+    "read": {"file": {"/usr/libexec/wanpilot-coordinator": ["exec"]}}
+  }
+}
