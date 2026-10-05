@@ -1,0 +1,7 @@
+{
+  "luci-app-wanpilot-recovery": {
+    "description": "WanPilot emergency recovery",
+    "read": {"file": {"/usr/libexec/wanpilot-recovery": ["exec"]}},
+    "write": {"file": {"/usr/libexec/wanpilot-recovery": ["exec"]}}
+  }
+}
