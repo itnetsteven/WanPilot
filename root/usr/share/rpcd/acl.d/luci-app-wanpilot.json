@@ -1,0 +1,23 @@
+{
+  "luci-app-wanpilot": {
+    "description": "WanPilot configuration and control",
+    "read": {
+      "uci": ["wanpilot","mwan3","network"]
+    },
+    "write": {
+      "uci": ["wanpilot"],
+      "file": {
+        "/usr/libexec/wanpilot": ["exec"],
+        "/usr/libexec/wanpilot-stage": ["exec"],
+        "/usr/libexec/wanpilot-safe": ["exec"],
+        "/usr/libexec/wanpilot-ui-status": ["exec"],
+        "/usr/libexec/wanpilot-weight": ["exec"],
+        "/usr/libexec/wanpilot-v17": ["exec"],
+        "/usr/libexec/wanpilot-global-preview": ["exec"],
+        "/usr/libexec/wanpilot-global-safe": ["exec"],
+        "/usr/libexec/wanpilot-v25-diff": ["exec"],
+        "/usr/libexec/wanpilot-v26-audit": ["exec"]
+      }
+    }
+  }
+}
