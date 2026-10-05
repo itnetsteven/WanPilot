@@ -1,0 +1,49 @@
+#!/bin/sh
+# WanPilot V2.5 read-only publication summary.
+# No UCI set/commit, cp to live config, or service restart.
+set -eu
+command -v uci >/dev/null 2>&1 || { echo 'ERROR: uci unavailable' >&2; exit 1; }
+command -v mwan3 >/dev/null 2>&1 || { echo 'ERROR: mwan3 unavailable' >&2; exit 1; }
+FIELD=''
+read_status() {
+    TOOL="$1"
+    [ -x "$TOOL" ] || { echo "ERROR: missing status backend: $TOOL" >&2; return 1; }
+    STATUS_OUTPUT=$("$TOOL" status) || { echo "ERROR: status failure: $TOOL" >&2; return 1; }
+    PENDING=$(printf '%s\n' "$STATUS_OUTPUT" | sed -n 's/^pending=//p' | head -n 1)
+    STATE=$(printf '%s\n' "$STATUS_OUTPUT" | sed -n 's/^state=//p' | head -n 1)
+    case "$PENDING" in yes|no) :;; *) echo "ERROR: invalid status: $TOOL" >&2; return 1;; esac
+    [ -n "$STATE" ] || { echo "ERROR: missing state: $TOOL" >&2; return 1; }
+}
+read_status /usr/libexec/wanpilot-safe
+DEVICE_PENDING=$PENDING; DEVICE_STATE=$STATE
+read_status /usr/libexec/wanpilot-global-safe
+GLOBAL_PENDING=$PENDING; GLOBAL_STATE=$STATE
+TARGET=$(uci -q get wanpilot.main.global_wan_pct || true)
+case "$TARGET" in ''|*[!0-9]*) echo 'ERROR: target weight is missing or invalid' >&2; exit 1;; esac
+[ "$TARGET" -ge 5 ] && [ "$TARGET" -le 95 ] || { echo 'ERROR: target outside 5..95' >&2; exit 1; }
+RULE_COUNT=$(uci -q show wanpilot | awk '/=rule$/ {n++} END {print n+0}')
+ENABLED_COUNT=$(uci -q show wanpilot | awk '
+  /=rule$/ {split($1,k,"="); rules[k[1]]=1}
+  /\.enabled=/ {split($1,k,".enabled="); if ($0 ~ /enabled=.[1].$/) enabled[k[1]]=1}
+  END {for(k in rules) if(enabled[k]) n++; print n+0}
+')
+STATUS=$(mwan3 status) || { echo 'ERROR: mwan3 status failed' >&2; exit 1; }
+RUNNING=$(printf '%s\n' "$STATUS" | awk '
+  /^Current ipv4 policies:/ {inside=1;next}
+  /^Current ipv6 policies:/ {inside=0}
+  inside && /^balanced:/ {found=1;next}
+  inside && found && /^[^[:space:]]/ {exit}
+  inside && found && /wan1? \([0-9]+%\)/ {gsub(/^[[:space:]]+/,""); printf "%s ",$0}
+')
+[ -n "$RUNNING" ] || { echo 'ERROR: unable to read active balanced weights' >&2; exit 1; }
+printf '当前 balanced: %s\n' "$RUNNING"
+printf '已保存目标: WAN %s%% / WAN1 %s%%\n' "$TARGET" "$((100-TARGET))"
+printf '设备规则: %s 条（启用字段检测值 %s；实际应用以候选审计为准）\n' "$RULE_COUNT" "$ENABLED_COUNT"
+printf '设备应用任务: %s（待确认: %s）\n' "$DEVICE_STATE" "$DEVICE_PENDING"
+printf '全局应用任务: %s（待确认: %s）\n' "$GLOBAL_STATE" "$GLOBAL_PENDING"
+if [ "$DEVICE_PENDING" = yes ] || [ "$GLOBAL_PENDING" = yes ]; then
+  echo '发布建议: 有任务等待确认，先完成确认或回滚；不要发起新应用。'
+else
+  echo '发布建议: 没有待确认任务；应用前仍需执行现有安全检查。'
+fi
+echo 'READ ONLY: mwan3 configuration was not modified.'
