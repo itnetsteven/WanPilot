@@ -131,6 +131,7 @@ validate() {
   rules_seen=''
   config_foreach check_rule rule
 }
+
 preflight() {
   validate
   [ -z "$(uci -q changes wanpilot)" ] || err 'Unsaved WanPilot UCI changes; save before preflight'
@@ -150,6 +151,7 @@ preflight() {
     fi
   done
   [ "$found" = 1 ] || err 'Missing default_rule_v4'
+  # Protect existing site-specific and device rules: only our wpx_* sections are managed.
   for sec in $(uci -q show mwan3 | sed -n 's/^mwan3\.\(wpx_[A-Za-z0-9_]*\)=.*/\1/p'); do
     case "$sec" in wpx_p_*|wpx_a_*|wpx_b_*|wpx_r_*) :;; *) err "Unexpected managed section $sec";; esac
   done
@@ -160,10 +162,12 @@ preflight() {
   echo 'Existing router_local and fix* rules are preserved.'
   echo 'IMPORTANT: watchdog and connectivity behavior still require local real-router testing.'
 }
+
 apply() {
   ( flock -x 9 || err 'Cannot lock configuration'
     [ ! -e "$PENDING" ] || err 'Pending strategy awaiting confirmation: confirm or wait for rollback first'
     preflight
+    # Read-only validate/preview work when disabled; applying must remain guarded.
     config_get enabled main enabled '0'
     [ "$enabled" = 1 ] || err 'WanPilot write access is disabled. Enable it before applying a strategy.'
     [ -z "$(uci -q changes mwan3)" ] || err "Uncommitted mwan3 changes detected; save or revert them first"
@@ -175,6 +179,8 @@ apply() {
     created_rules=''
     config_foreach make_profile profile
     config_foreach make_rule rule
+    # Preserve original priority for router_local/fix* and other explicit rules.
+    # Insert only before the original IPv4 catch-all rule.
     [ -z "$created_rules" ] || {
       position=0
       found=0
@@ -186,6 +192,7 @@ apply() {
         esac
       done
       [ "$found" = 1 ] || err 'No default_rule_v4 catch-all found: refuse automatic rule reordering'
+      # uci reorder counts ALL section types, not only rules. Determine full index.
       position=0
       for sec in $(uci -q show mwan3 | sed -n 's/^mwan3\.\([A-Za-z0-9_]*\)=[A-Za-z0-9_]*$/\1/p'); do
         [ "$sec" = default_rule_v4 ] && break
@@ -197,8 +204,10 @@ apply() {
       done
     }
     uci -q commit mwan3
+    # Start watchdog BEFORE restarting mwan3: a hanging restart must not defeat rollback.
     date +%s > "$PENDING"
     ( exec 9>&-; nohup /bin/sh /usr/libexec/wanpilot watchdog >/tmp/wanpilot-watchdog.log 2>&1 </dev/null & )
+    # Do not disarm the emergency EXIT trap until restart completes successfully.
     /etc/init.d/mwan3 restart
     trap - EXIT
     echo 'APPLIED_PENDING; confirm within 120 seconds or original mwan3 will be restored'
@@ -215,6 +224,7 @@ rollback() {
     echo 'RESTORED'
   ) 9>"$LOCK"
 }
+
 confirm() {
   ( flock -x 9 || err 'Cannot lock configuration'
     [ -f "$PENDING" ] || err 'No pending changes'
@@ -243,6 +253,7 @@ operation_state() {
     case "$started" in ''|*[!0-9]*) echo 'pending|unknown';; *) left=$((ROLLBACK_TIMEOUT - now + started)); [ "$left" -gt 0 ] || left=0; echo "pending|$left";; esac
   else echo 'idle|0'; fi
 }
+
 print_profile() {
   local name mode primary secondary
   config_get name "$1" name; config_get mode "$1" mode
@@ -256,11 +267,13 @@ print_rule() {
   config_get src "$1" src_ip ''; config_get device_ip "$1" device_ip ''; [ -n "$src" ] || src="$device_ip"; config_get dst "$1" dest_ip ''; config_get port "$1" dest_port ''
   echo "  $name: src=$src dst=$dst port=$port -> $profile"
 }
+# Read-only, tab-separated snapshots for LuCI (device names sanitized).
 read_status() {
   echo 'interface|state|device|ipv4|rx_bytes|tx_bytes'
   for name in $(uci -q show mwan3 | sed -n 's/^mwan3\.\([A-Za-z0-9_]*\)=interface$/\1/p'); do
     device="$(uci -q get "network.$name.device" 2>/dev/null || :)"
     [ -n "$device" ] || device="$(uci -q get "network.$name.ifname" 2>/dev/null || :)"
+    # PPPoE ifname is supplied by netifd; eth0/eth3 are physical links, not traffic counters.
     l3="$(ubus call "network.interface.$name" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null || :)"
     [ -n "$l3" ] && device="$l3"
     ip="$(ubus call "network.interface.$name" status 2>/dev/null | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null || :)"
@@ -273,8 +286,7 @@ read_status() {
       read -r rx < "/sys/class/net/$device/statistics/rx_bytes" || rx=0
       read -r tx < "/sys/class/net/$device/statistics/tx_bytes" || tx=0
     fi
-    printf '%s|%s|%s|%s|%s|%s
-' "$name" "$state" "$device" "$ip" "$rx" "$tx"
+    printf '%s|%s|%s|%s|%s|%s\n' "$name" "$state" "$device" "$ip" "$rx" "$tx"
   done
 }
 device_name_file='/etc/wanpilot/device-names.tsv'
@@ -284,51 +296,52 @@ cache_device_name() {
   mac="$(printf '%s' "${1:-}" | tr 'A-F' 'a-f')"
   name="${2:-}"
   case "$mac" in ??\:??\:??\:??\:??\:??) :;; *) return 1;; esac
-  name="$(printf '%s' "$name" | tr '|
-	' '____' | cut -c1-60)"
+  name="$(printf '%s' "$name" | tr '|\r\n\t' '____' | cut -c1-60)"
   [ -n "$name" ] && [ "$name" != '*' ] || return 1
   mkdir -p /etc/wanpilot
   touch "$device_name_file"
   tmpn="$(mktemp /etc/wanpilot/device-names.XXXXXX)" || return 1
   awk -F'|' -v m="$mac" 'tolower($1)!=m' "$device_name_file" > "$tmpn" 2>/dev/null || :
-  printf '%s|%s
-' "$mac" "$name" >> "$tmpn"
+  printf '%s|%s\n' "$mac" "$name" >> "$tmpn"
   chmod 600 "$tmpn"
   mv "$tmpn" "$device_name_file"
 }
+
 learn_device_name() {
   mac="$(printf '%s' "${1:-}" | tr 'A-F' 'a-f')"; name="${2:-}"
   case "$mac" in ??\:??\:??\:??\:??\:??) :;; *) return 1;; esac
-  name="$(printf '%s' "$name" | tr '|
-	' '____' | cut -c1-60)"
+  name="$(printf '%s' "$name" | tr '|\r\n\t' '____' | cut -c1-60)"
   [ -n "$name" ] && [ "$name" != '*' ] || return 1
+  # A manual WanPilot name always wins; never overwrite it with learned data.
   [ -r "$device_name_file" ] && awk -F'|' -v m="$mac" 'tolower($1)==m{found=1} END{exit !found}' "$device_name_file" && return 0
   mkdir -p /etc/wanpilot
   touch "$device_learned_name_file"
   tmpl="$(mktemp /etc/wanpilot/device-names-learned.XXXXXX)" || return 1
   awk -F'|' -v m="$mac" 'tolower($1)!=m' "$device_learned_name_file" > "$tmpl" 2>/dev/null || :
-  printf '%s|%s
-' "$mac" "$name" >> "$tmpl"
+  printf '%s|%s\n' "$mac" "$name" >> "$tmpl"
   chmod 600 "$tmpl"
   mv "$tmpl" "$device_learned_name_file"
 }
+
 device_name_set() {
   mac="${1:-}"; name="${2:-}"
   [ -n "$name" ] || err 'Device name cannot be empty'
   cache_device_name "$mac" "$name" || err 'Invalid device MAC or name'
   echo "saved=1"
 }
+
 read_devices() {
   echo 'ip|mac|name|expires'
   leasefile="$(uci -q get dhcp.@dnsmasq[0].leasefile 2>/dev/null || :)"
   [ -n "$leasefile" ] || leasefile='/tmp/dhcp.leases'
   tmp="$(mktemp /tmp/wanpilot-devices.XXXXXX)" || return 1
   trap 'rm -f "$tmp"' EXIT INT TERM
+
   if [ -r "$leasefile" ]; then
-    awk 'NF >= 4 && $3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $2 ~ /^[0-9A-Fa-f:]+$/ {name=$4;gsub(/[|
-	]/,"_",name);if(length(name)>60)name=substr(name,1,60);printf "%s|%s|%s|%s\n",$3,$2,name,$1}' "$leasefile" >> "$tmp"
+    awk 'NF >= 4 && $3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $2 ~ /^[0-9A-Fa-f:]+$/ {name=$4;gsub(/[|\r\n\t]/,"_",name);if(length(name)>60)name=substr(name,1,60);printf "%s|%s|%s|%s\n",$3,$2,name,$1}' "$leasefile" >> "$tmp"
   fi
   ip neigh show 2>/dev/null | awk '$1 ~ /^192\.168\.188\.[0-9]+$/ {mac=""; for(i=1;i<=NF;i++) if($i=="lladdr" && (i+1)<=NF) mac=$(i+1); if(mac ~ /^[0-9A-Fa-f:]+$/) print $1"|"mac"|*|0"}' >> "$tmp"
+
   awk -F'|' '!seen[$1]++' "$tmp" | while IFS='|' read -r ip mac name expires; do
     mac_l="$(printf '%s' "$mac" | tr 'A-F' 'a-f')"
     manual=''
@@ -342,6 +355,7 @@ read_devices() {
     if [ -n "$manual" ]; then
       name="$manual"
     elif [ -n "$name" ] && [ "$name" != '*' ]; then
+      # Current DHCP hostname is useful immediately and is learned for future reboots.
       learn_device_name "$mac_l" "$name" || :
     elif [ -n "$learned" ]; then
       name="$learned"
@@ -353,22 +367,23 @@ read_devices() {
       fi
     fi
     [ -n "$name" ] || name='*'
-    name="$(printf '%s' "$name" | tr '|
-	' '____' | cut -c1-60)"
-    printf '%s|%s|%s|%s
-' "$ip" "$mac_l" "$name" "$expires"
+    name="$(printf '%s' "$name" | tr '|\r\n\t' '____' | cut -c1-60)"
+    printf '%s|%s|%s|%s\n' "$ip" "$mac_l" "$name" "$expires"
   done
   rm -f "$tmp"
   trap - EXIT INT TERM
 }
+
+# Device shortcut: write only WanPilot UCI, never modify mwan3 or restart networking.
 assign_device() {
   ip="${1:-}"; choice="${2:-}"
+  # Strict local subnet check for known LAN in this deployment.
   case "$ip" in 192.168.188.*) :;; *) err 'Device address outside configured LAN';; esac
   octet="${ip##*.}"
   case "$octet" in ''|*[!0-9]*) err 'Invalid device address';; esac
   [ "$octet" -ge 1 ] && [ "$octet" -le 254 ] || err 'Invalid LAN host';
-  case "$ip" in */*|*' '*|*'
-'*) err 'Invalid IP address';; esac
+  case "$ip" in */*|*' '*|*'\n'*) err 'Invalid IP address';; esac
+  # Resolve the two managed WANs from the saved dualwan profile; fall back to wan/wan1 for this deployment.
   base_primary=''; base_secondary=''
   for psec in $(uci -q show wanpilot | sed -n 's/^wanpilot\.\([^.=]*\)=profile$/\1/p'); do
     [ "$(uci -q get "wanpilot.$psec.name" || :)" = dualwan ] || continue
@@ -398,6 +413,7 @@ assign_device() {
   ( flock -x 9 || err 'Cannot lock WanPilot config'
     [ -z "$(uci -q changes wanpilot)" ] || err 'Uncommitted WanPilot changes present: save or revert first'
     rule_name="dev$((octet))"
+    # Check all existing profiles/rules, including unnamed sections and manually created entries.
     for sec in $(uci -q show wanpilot | sed -n 's/^wanpilot\.\([^.=]*\)=profile$/\1/p'); do
       n="$(uci -q get "wanpilot.$sec.name" || :)"
       [ "$n" = "$pname" ] || continue
@@ -411,6 +427,7 @@ assign_device() {
       dev="$(uci -q get "wanpilot.$sec.device_ip" || :)"
       name="$(uci -q get "wanpilot.$sec.name" || :)"
       if [ "$src" = "$ip/32" ] || [ "$dev" = "$ip/32" ] || [ "$name" = "$rule_name" ]; then
+        # Don't overwrite a manually defined or overlapping rule.
         [ "$name" = "$rule_name" ] && { [ "$src" = "$ip/32" ] || [ "$dev" = "$ip/32" ]; } || err 'Conflicting existing device rule; edit it in rules table'
         [ -z "$(uci -q get "wanpilot.$sec.dest_ip" || :)" ] || err 'Existing device rule contains destination constraint'
         [ -z "$(uci -q get "wanpilot.$sec.dest_port" || :)" ] || err 'Existing device rule contains port constraint'
@@ -442,10 +459,15 @@ assign_device() {
       cp /etc/wanpilot/device-edit.backup /etc/config/wanpilot; uci -q revert wanpilot || :
       err 'Cannot commit WanPilot config'
     fi
+    # Verify the saved config independently of browser state.
     [ "$(uci -q get "wanpilot.$rule_sec.src_ip")" = "$ip/32" ] || err 'Saved configuration verification failed'
     echo "SAVED WanPilot device $ip -> $pname (mwan3 UNCHANGED)"
   ) 9>"$LOCK"
 }
+
+
+# Remove ONLY a verified autogenerated per-device rule from WanPilot UCI.
+# This deliberately does not change mwan3 or restart any service.
 remove_device() {
   ip="${1:-}"
   case "$ip" in 192.168.188.*) :;; *) err 'Device address outside managed LAN';; esac
@@ -474,6 +496,8 @@ remove_device() {
       fi
     done
     [ -n "$found" ] || err 'No autogenerated device rule found'
+    # Remove only the desired WanPilot shortcut. The live mwan3 rule remains
+    # unchanged until the existing safe publication process applies it.
     cp /etc/config/wanpilot /etc/wanpilot/device-edit.backup || err 'Cannot back up WanPilot config'
     uci -q delete "wanpilot.$found" || err 'Cannot remove device rule'
     if ! uci -q commit wanpilot; then
@@ -489,6 +513,10 @@ remove_device() {
     echo "REMOVED WanPilot shortcut for $ip (mwan3 UNCHANGED)"
   ) 9>"$LOCK"
 }
+
+
+# Toggle failover for WanPilot's autogenerated per-device WAN/WAN1 shortcuts.
+# Only /etc/config/wanpilot is changed here; live mwan3 is handled by the existing protected apply path.
 set_device_failover() {
   flag="${1:-}"
   case "$flag" in 0|1) :;; *) err 'device-failover-set expects 0 or 1';; esac
@@ -499,6 +527,7 @@ set_device_failover() {
     flock -x 9 || err 'Cannot lock WanPilot config'
     [ -z "$(uci -q changes wanpilot)" ] || err 'Uncommitted WanPilot changes present: save or revert first'
     cp /etc/config/wanpilot /etc/wanpilot/device-failover.backup || err 'Cannot back up WanPilot config'
+
     base_primary=''; base_secondary=''
     for psec in $(uci -q show wanpilot | sed -n 's/^wanpilot\.\([^.=]*\)=profile$/\1/p'); do
       [ "$(uci -q get "wanpilot.$psec.name" || :)" = dualwan ] || continue
@@ -510,6 +539,7 @@ set_device_failover() {
     [ -n "$base_secondary" ] || base_secondary='wan1'
     interfaces_exist "$base_primary"
     interfaces_exist "$base_secondary"
+
     uci -q set "wanpilot.main.device_failover=$flag" || err 'Cannot save failover setting'
     for sec in $(uci -q show wanpilot | sed -n 's/^wanpilot\.\([^.=]*\)=profile$/\1/p'); do
       name="$(uci -q get "wanpilot.$sec.name" || :)"
@@ -547,6 +577,8 @@ set_device_failover() {
     echo "SAVED device_failover=$flag (mwan3 UNCHANGED)"
   ) 9>"$LOCK"
 }
+
+# Read-only runtime status; not an external-IP proof. No network changes.
 runtime_audit() {
   cfg_name="$(uci -q get wanpilot.@rule[0].name || :)"
   cfg_source="$(uci -q get wanpilot.@rule[0].src_ip || :)"
@@ -572,8 +604,8 @@ runtime_audit() {
   echo "CONFIG: mwan3 rule=$rule source=$src policy=$profile"
   if ! command -v mwan3 >/dev/null 2>&1; then echo 'RESULT: mwan3 executable unavailable'; return 1; fi
   runtime="$(mwan3 status 2>&1)" || { echo 'RESULT: mwan3 status failed'; return 1; }
-  if printf '%s
-' "$runtime" | grep -F -- "$cfg_source" | grep -F -- "$profile" >/dev/null; then
+  # mwan3 status shows user rules without their UCI names, match the IP and policy.
+  if printf '%s\n' "$runtime" | grep -F -- "$cfg_source" | grep -F -- "$profile" >/dev/null; then
     echo 'RESULT: configured rule appears in active mwan3 status'
   else
     echo 'RESULT: rule installed in UCI but not confirmed in active mwan3 status'
@@ -581,6 +613,7 @@ runtime_audit() {
   fi
   echo 'NOTE: runtime table presence does not prove the actual public egress IP.'
 }
+
 case "${1:-}" in
   assign-device) assign_device "${2:-}" "${3:-}";;
   remove-device) remove_device "${2:-}";;

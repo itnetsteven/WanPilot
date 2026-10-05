@@ -23,7 +23,7 @@ sha() { sha256sum "$1" | awk '{print $1}'; }
 die() { echo "ERROR: $*" >&2; exit 1; }
 locked() { flock -x 8 || die 'Cannot obtain shared mwan3 lock'; flock -x 9 || die 'Cannot obtain application lock'; }
 check_tools() {
- for cmd in flock sha256sum nohup uci awk cp mv; do command -v "$cmd" >/dev/null 2>&1 || die "Missing command: $cmd"; done
+ for cmd in flock sha256sum nohup uci awk cp mv cmp grep sort; do command -v "$cmd" >/dev/null 2>&1 || die "Missing command: $cmd"; done
  [ -x /etc/init.d/mwan3 ] || die 'mwan3 service not present'
  [ -x "$STAGER" ] || die 'Stage generator not installed'
  [ -f "$LIVE" ] || die 'mwan3 config missing'
@@ -32,29 +32,53 @@ check_tools() {
  [ -z "$(uci -q changes wanpilot)" ] || die 'Pending WanPilot UCI edits'
  [ ! -f /etc/wanpilot/pending ] || die 'Legacy WanPilot change pending'
  [ ! -e /etc/wanpilot/v11/pending ] || die 'Device policy application pending'
- [ -z "$(uci -q show mwan3 | grep '^mwan3\.wpx_global_' || :)" ] || die 'Global managed sections already present; refuse overwrite'
 }
 check_candidate() {
  [ -f "$CANDIDATE" ] && [ -f "$BACKUP" ] || die 'Missing candidate or backup'
  [ -f "$SOURCE_SHA" ] && [ -f "$SOURCE" ] || die 'WanPilot configuration fingerprint missing'
  [ ! -e /etc/wanpilot/v11/pending ] || die 'Device application in progress'
+ [ -z "$(uci -q changes mwan3)" ] && [ -z "$(uci -q changes wanpilot)" ] || die 'Uncommitted UCI edits'
  [ "$(sha "$SOURCE")" = "$(cat "$SOURCE_SHA")" ] || die 'WanPilot rules changed since readiness check; run check again'
  [ "$(sha "$LIVE")" = "$(sha "$BACKUP")" ] || die 'Live mwan3 changed after snapshot'
  [ "$(sha "$CANDIDATE")" = "$(cat "$BASE/candidate.sha")" ] || die 'Candidate modified after stage'
  [ "$(sha "$BACKUP")" = "$(cat "$BASE/original.sha")" ] || die 'Backup modified after stage'
- [ "$(uci -c "$BASE/config" -p "$BASE/delta" -q get mwan3.balanced.use_member)" = 'wpx_global_wan wpx_global_wan1' ] || die 'Balanced members do not match planned change'
+ [ "$(uci -c "$BASE/config" -P "$BASE/delta" -q get mwan3.balanced.use_member)" = 'wpx_global_wan wpx_global_wan1' ] || die 'Balanced members do not match planned change'
  pct="$(uci -q get wanpilot.main.global_wan_pct || :)"
  case "$pct" in ''|*[!0-9]*) die 'Invalid global percentage';; esac
- [ "$(uci -c "$BASE/config" -p "$BASE/delta" -q get mwan3.wpx_global_wan.weight)" = "$pct" ] || die 'WAN weight differs from target'
- [ "$(uci -c "$BASE/config" -p "$BASE/delta" -q get mwan3.wpx_global_wan1.weight)" = "$((100-pct))" ] || die 'WAN1 weight differs from target'
- [ "$(sha "$CANDIDATE")" != "$(sha "$BACKUP")" ] || die 'Candidate identical to current configuration' 
+ [ "$(uci -c "$BASE/config" -P "$BASE/delta" -q get mwan3.wpx_global_wan.weight)" = "$pct" ] || die 'WAN weight differs from target'
+ [ "$(uci -c "$BASE/config" -P "$BASE/delta" -q get mwan3.wpx_global_wan1.weight)" = "$((100-pct))" ] || die 'WAN1 weight differs from target'
+ # Recheck the immutable portion against the current backup at APPLY time, not only during preview.
+ # Query each file with an isolated UCI directory and a fresh write delta.
+ mkdir -p "$BASE/audit-original" "$BASE/audit-delta"
+ cp "$BACKUP" "$BASE/audit-original/mwan3"
+ rm -f "$BASE/audit-delta/mwan3" "$BASE/delta/mwan3"
+ uci -c "$BASE/audit-original" -P "$BASE/audit-delta" show mwan3 | grep -v -E '^mwan3\.(balanced\.use_member|wpx_global_wan\.|wpx_global_wan1\.|wpx_global_wan=|wpx_global_wan1=)' | LC_ALL=C sort > "$BASE/audit.original.fields"
+ uci -c "$BASE/config" -P "$BASE/delta" show mwan3 | grep -v -E '^mwan3\.(balanced\.use_member|wpx_global_wan\.|wpx_global_wan1\.|wpx_global_wan=|wpx_global_wan1=)' | LC_ALL=C sort > "$BASE/audit.candidate.fields"
+ cmp -s "$BASE/audit.original.fields" "$BASE/audit.candidate.fields" || die 'Candidate altered non-global mwan3 configuration'
+ # There must be exactly two balanced members; no duplicates or fallback injection.
+ [ "$(uci -c "$BASE/config" -P "$BASE/delta" -q get mwan3.balanced.use_member)" = 'wpx_global_wan wpx_global_wan1' ] || die 'Unexpected balanced member order'
+ # Do not restart networking merely to rewrite a semantically identical 50/50 policy.
+ old_members="$(uci -q get mwan3.balanced.use_member || :)"
+ if [ "$old_members" = 'wpx_global_wan wpx_global_wan1' ]; then
+   old_w="$(uci -q get mwan3.wpx_global_wan.weight || :)"
+   old_w1="$(uci -q get mwan3.wpx_global_wan1.weight || :)"
+   if [ "$old_w" = "$pct" ] && [ "$old_w1" = "$((100-pct))" ]; then
+   [ "${ALLOW_NOOP:-0}" = 1 ] || die 'Current global policy already matches target; no application needed'
+ fi
+ fi
+ if [ "$(sha "$CANDIDATE")" = "$(sha "$BACKUP")" ]; then
+   [ "${ALLOW_NOOP:-0}" = 1 ] || die 'Candidate identical to current configuration'
+ fi  
 }
 check() {
  locked
  [ ! -e "$GUARD" ] || die 'An application is awaiting confirmation'
  check_tools
+ # Fail closed after any interrupted/incomplete check until a new READY is produced.
+ : > "$BASE/no-change"
  "$STAGER" || die 'Candidate generation failed'
  [ -f "$STAGED" ] || die 'Staged candidate absent'
+ # Avoid creating a new test from a stale candidate if config changed during staging.
  live_before="$(sha "$LIVE")"
  source_before="$(sha "$SOURCE")"
  [ -f /tmp/wanpilot-v18-preview/original.fields ] || die 'Missing global preview audit output'
@@ -68,9 +92,26 @@ check() {
  sha "$BACKUP" > "$BASE/original.sha"
  sha "$CANDIDATE" > "$BASE/candidate.sha"
  echo "$source_before" > "$SOURCE_SHA"
+ # UCI query with isolated configuration, never writes system config.
  mkdir -p "$BASE/delta" "$BASE/config"
  cp "$CANDIDATE" "$BASE/config/mwan3"
+ rm -f "$BASE/delta/mwan3"
+ # Validate the candidate graph and all unrelated fields even for no-op configurations.
+ ALLOW_NOOP=1 check_candidate
+ current_members="$(uci -q get mwan3.balanced.use_member || :)"
+ current_wan="$(uci -q get mwan3.wpx_global_wan.weight || :)"
+ current_wan1="$(uci -q get mwan3.wpx_global_wan1.weight || :)"
+ desired_wan="$(uci -q get wanpilot.main.global_wan_pct || :)"
+ if [ "$current_members" = 'wpx_global_wan wpx_global_wan1' ] &&
+    [ "$current_wan" = "$desired_wan" ] &&
+    [ "$current_wan1" = "$((100-desired_wan))" ]; then
+   # Semantic equality, not exported UCI file bytes. An export can reformat lines.
+   echo 'GLOBAL NO-CHANGE PASS: balanced policy already matches target; no application needed.'
+   echo "Live SHA256: $(sha "$LIVE")"
+   return 0
+ fi
  check_candidate
+ rm -f "$BASE/no-change"
  printf 'GLOBAL READY PASS: candidate and original verified; balanced WAN %s%% / WAN1 %s%%.\n' "$pct" "$((100-pct))"
  echo "Original SHA256: $(cat "$BASE/original.sha")"
  echo "Candidate SHA256: $(cat "$BASE/candidate.sha")"
@@ -80,10 +121,17 @@ check() {
 restore_locked() {
  [ -f "$BACKUP" ] && [ -f "$BASE/original.sha" ] || { echo 'RESTORE ERROR: backup missing' >> "$LOG"; echo restore_failed_backup > "$STATE"; return 1; }
  [ "$(sha "$BACKUP")" = "$(cat "$BASE/original.sha")" ] || { echo 'RESTORE ERROR: backup SHA mismatch' >> "$LOG"; echo restore_failed_backup_hash > "$STATE"; return 1; }
+ [ -z "$(uci -q changes mwan3)" ] || { echo restore_conflict_pending_uci > "$STATE"; return 1; }
+ now="$(sha "$LIVE")"
+ original="$(cat "$BASE/original.sha")"
+ candidate="$(cat "$BASE/candidate.sha" 2>/dev/null || :)"
+ if [ "$now" = "$original" ]; then rm -f "$GUARD" "$TOKEN"; echo restored > "$STATE"; return 0; fi
+ [ "$now" = "$candidate" ] || { echo restore_conflict_external_change > "$STATE"; return 1; }
  cp "$BACKUP" "$LIVE.recover.$$" || { echo restore_failed_copy > "$STATE"; return 1; }
  chmod 600 "$LIVE.recover.$$"
  mv "$LIVE.recover.$$" "$LIVE" || { echo restore_failed_move > "$STATE"; return 1; }
- uci -q revert mwan3 || :
+ # Never clear unrelated system UCI pending operations.
+ [ -z "$(uci -q changes mwan3)" ] || { echo restore_conflict_pending_uci > "$STATE"; return 1; }
  result=0
  /etc/init.d/mwan3 restart >> "$LOG" 2>&1 || result=1
  [ "$(sha "$LIVE")" = "$(cat "$BASE/original.sha")" ] || result=1
@@ -109,10 +157,12 @@ watchdog() {
  ) 8>"$SHARED_LOCK" 9>"$LOCK"
 }
 apply() {
+ # Intentionally not exposed via LuCI pending first real-world global rollback tests.
  locked
  [ ! -f "$GUARD" ] || die 'Application pending'
  [ ! -e /etc/wanpilot/v11/pending ] || die 'Device application pending'
  check_tools
+ [ ! -e "$BASE/no-change" ] || die 'Global target already active or last check was incomplete; run check after changing target'
  check_candidate
  [ -z "$(uci -q changes mwan3)" ] || die 'Pending mwan3 UCI edits'
  [ -z "$(uci -q changes wanpilot)" ] || die 'Pending WanPilot UCI edits'
@@ -130,7 +180,13 @@ apply() {
    i=$((i+1)); sleep 1
  done
  if [ "$ok" -ne 1 ]; then rm -f "$GUARD" "$TOKEN"; echo arming_failed > "$STATE"; die 'Watchdog not ready; live config unchanged'; fi
- [ "$(sha "$LIVE")" = "$(cat "$BASE/original.sha")" ] || die 'Live config changed; watchdog will restore backup'
+ # Recheck that WAN config was not altered while waiting for watchdog.
+ if [ "$(sha "$LIVE")" != "$(cat "$BASE/original.sha")" ]; then
+   rm -f "$GUARD" "$TOKEN"
+   echo arming_cancelled_live_changed > "$STATE"
+   die 'Live config changed before write; watchdog cancelled'
+ fi
+ [ -z "$(uci -q changes mwan3)" ] || { rm -f "$GUARD" "$TOKEN"; echo arming_cancelled_uci > "$STATE"; die 'Uncommitted mwan3 changes before write'; }
  if [ "$(sha "$SOURCE")" != "$(cat "$SOURCE_SHA")" ]; then
    rm -f "$GUARD" "$TOKEN"
    echo arming_cancelled_source_changed > "$STATE"
@@ -140,13 +196,16 @@ apply() {
  cp "$CANDIDATE" "$LIVE.install.$$" || die 'copy failed; watchdog armed'
  chmod 600 "$LIVE.install.$$"
  mv "$LIVE.install.$$" "$LIVE" || die 'move failed; watchdog armed'
- uci -q revert mwan3 || :
+ # Never clear unrelated system UCI pending operations.
+ [ -z "$(uci -q changes mwan3)" ] || { echo restore_conflict_pending_uci > "$STATE"; return 1; }
  if ! /etc/init.d/mwan3 restart >> "$LOG" 2>&1; then echo pending_restart_failed > "$STATE"; die 'mwan3 restart failed; watchdog remains armed'; fi
  echo 'PENDING: confirm within 120 seconds or automatic restore'
 }
 confirm() {
  locked
  [ -f "$GUARD" ] || die 'No pending application'
+ [ -z "$(uci -q changes mwan3)" ] && [ -z "$(uci -q changes wanpilot)" ] || die 'Pending UCI edits; cannot confirm'
+ [ "$(sha "$SOURCE")" = "$(cat "$SOURCE_SHA")" ] || die 'WanPilot changed; cannot confirm'
  [ "$(sha "$LIVE")" = "$(cat "$BASE/candidate.sha")" ] || die 'Live candidate changed; cannot confirm'
  kill -0 "$(cat "$PID")" 2>/dev/null || die 'Watchdog unavailable; cannot confirm'
  rm -f "$GUARD" "$TOKEN"

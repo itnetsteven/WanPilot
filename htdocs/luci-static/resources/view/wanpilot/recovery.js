@@ -56,7 +56,7 @@ return view.extend({
     return E('div', {}, [
       E('h2', {}, 'WanPilot 应急恢复'),
       E('p', {}, '此页面只用于网络调整后出现异常时恢复最近一次应用前的 mwan3 配置。日常设置请返回 WanPilot 主页面。'),
-      E('div', {'class':'alert-message warning'}, '恢复页依赖路由器 LAN 管理仍可访问。如果 192.168.188.1 本身无法访问，需要通过本地终端或其他维护方式处理。'),
+      E('div', {'class':'alert-message warning'}, '恢复页依赖路由器 LAN 管理仍可访问。如果路由器 LAN 管理地址本身无法访问，需要通过本地终端或其他维护方式处理。'),
       statusBox,
       E('div', {'class':'cbi-section'}, [button]),
       result

@@ -22,10 +22,11 @@ function wpParseStatus(body) {
   });
   return fields;
 }
-function wpConfirmPending(kind) {
+function wpConfirmPending(kind, progressCb) {
   var backend = kind === 'device' ? '/usr/libexec/wanpilot-safe' : '/usr/libexec/wanpilot-global-safe';
   var label = kind === 'device' ? '设备线路' : '全局比例';
   var candidateSha = '';
+  if (progressCb) progressCb('verify', 78, '正在核验应用后的事务状态…');
   return fs.exec(backend, ['status']).then(function(status) {
     if (!status || status.code !== 0) throw Error(label + '应用后无法读取事务状态');
     var f = wpParseStatus(status.stdout);
@@ -34,6 +35,7 @@ function wpConfirmPending(kind) {
     if (!/^[0-9a-f]{64}$/.test(f.candidate_sha || '') || f.candidate_sha !== f.live_sha)
       throw Error(label + '应用后候选配置与当前运行配置不一致');
     candidateSha = f.candidate_sha;
+    if (progressCb) progressCb('verify', 84, '正在检查连通性与配置指纹…');
     return fs.exec('/usr/libexec/wanpilot-quick-guard', [kind, candidateSha]);
   }).then(function(guard) {
     if (!guard || guard.code !== 0)
@@ -44,6 +46,7 @@ function wpConfirmPending(kind) {
     var f = wpParseStatus(fresh.stdout);
     if (f.pending !== 'yes' || f.candidate_sha !== candidateSha || f.live_sha !== candidateSha)
       throw Error(label + '确认前事务状态发生变化，保持自动回滚保护');
+    if (progressCb) progressCb('confirm', 92, '安全检查通过，正在自动确认…');
     return fs.exec(backend, ['confirm']);
   }).then(function(confirmed) {
     if (!confirmed || confirmed.code !== 0)
@@ -56,6 +59,7 @@ function wpConfirmPending(kind) {
       throw Error(label + '未完成最终确认：state=' + (f.state || 'unknown') + ', pending=' + (f.pending || 'unknown'));
     if (candidateSha && f.live_sha && f.live_sha !== candidateSha)
       throw Error(label + '确认后运行配置指纹发生变化');
+    if (progressCb) progressCb('done', 100, '配置已应用并自动确认。');
     return f;
   });
 }
@@ -70,19 +74,23 @@ function wpRetainAfterSuccessfulApply(kind) {
   });
 }
 // Complete one protected transaction without relying on legacy buttons or backend prose.
-function wpApplyAndConfirm(kind) {
+function wpApplyAndConfirm(kind, progressCb) {
   var backend = kind === 'device' ? '/usr/libexec/wanpilot-safe' : '/usr/libexec/wanpilot-global-safe';
   var label = kind === 'device' ? '设备线路' : '全局比例';
+  if (progressCb) progressCb('snapshot', 28, '正在保存应用前恢复点…');
   return wpCaptureBeforeApply(kind + '-save-apply').then(function() {
+    if (progressCb) progressCb('check', 42, '正在执行安全预检…');
     return fs.exec(backend, ['check']);
   }).then(function(check) {
     if (!check || check.code !== 0)
       throw Error(label + '安全预检失败：' + ((check && (check.stderr || check.stdout)) || '未知错误'));
+    if (progressCb) progressCb('apply', 62, '安全预检通过，正在应用网络配置…');
     return fs.exec(backend, ['apply']);
   }).then(function(applied) {
     if (!applied || applied.code !== 0)
       throw Error(label + '应用失败：' + ((applied && (applied.stderr || applied.stdout)) || '未知错误'));
-    return wpConfirmPending(kind);
+    if (progressCb) progressCb('verify', 76, '配置已应用，正在核验并准备自动确认…');
+    return wpConfirmPending(kind, progressCb);
   });
 }
 
@@ -224,7 +232,7 @@ return view.extend({
   }
   function deviceRow(d) {
     var ip=d[0], saved=savedDeviceOutlet(ip), rules=deviceRuleFor(ip);
-    var label=d[2]&&d[2]!=='*'?d[2]:(ip==='192.168.188.109'?'OPPO-Find-N3':'未命名设备');
+    var label=d[2]&&d[2]!=='*'?d[2]:'未命名设备';
     var isManual=rules.some(function(x){return !/^dev[0-9]{1,3}$/.test(x.name||'');});
     var hasConflict=rules.length>1||isManual||saved==='none'&&rules.length>0;
     var preset=rules.length===0?'default':saved;
@@ -728,7 +736,7 @@ return view.extend({
     // local DNS hostname for unnamed devices and learns successful results by MAC.
     // Within each group, sort by numeric IPv4 address for a stable, predictable list.
     function wpDeviceDisplayName(d){
-      return (d[2]&&d[2]!=='*')?d[2]:(d[0]==='192.168.188.109'?'OPPO-Find-N3':'未命名设备');
+      return (d[2]&&d[2]!=='*')?d[2]:'未命名设备';
     }
     function wpIpv4Number(ip){
       var x=String(ip||'').split('.').map(Number);
@@ -1367,6 +1375,21 @@ return view.extend({
     // NEVER runs two independent apply transactions or confirms automatically.
     var wpUnifiedActionBusy=false;
     var wpUnifiedActionStatus=E('div',{'role':'status','style':'color:#475569;font-size:13px;margin-top:8px'},'修改后点击一次即可保存、应用并自动确认；失败时仍由回滚保护恢复原配置。');
+    var wpApplyProgressFill=E('div',{'class':'wp125-progress-fill','style':'width:0%'},[]);
+    var wpApplyProgressPct=E('span',{'class':'wp125-progress-pct'},'0%');
+    var wpApplyProgressLabel=E('span',{'class':'wp125-progress-label'},'待命');
+    var wpApplySteps=['保存','安全检查','应用配置','自动确认'];
+    var wpApplyStepNodes=wpApplySteps.map(function(label){return E('div',{'class':'wp125-step'},[E('span',{'class':'wp125-step-dot'},''),E('span',{},label)]);});
+    function wpSetApplyProgress(stage,pct,message){
+      pct=Math.max(0,Math.min(100,Number(pct)||0));
+      wpApplyProgressFill.style.width=pct+'%';
+      wpApplyProgressPct.textContent=Math.round(pct)+'%';
+      wpApplyProgressLabel.textContent=message||'处理中…';
+      var thresholds=[20,40,65,90];
+      wpApplyStepNodes.forEach(function(node,i){node.classList.toggle('is-done',pct>=thresholds[i]);node.classList.toggle('is-active',pct<thresholds[i] && (i===0||pct>=thresholds[i-1]));});
+      var card=viewNode('wp125-save-card');if(card){card.classList.toggle('is-running',stage!=='idle'&&stage!=='done'&&stage!=='error');card.classList.toggle('is-done',stage==='done');card.classList.toggle('is-error',stage==='error');}
+    }
+    function wpUnifiedProgress(stage,pct,message){wpSetApplyProgress(stage,pct,message);if(message)wpUnifiedActionStatus.textContent=message;}
     var wpUnifiedActionScope=E('select',{'class':'cbi-input-select','aria-label':'应用范围','style':'min-width:180px'},[
       E('option',{'value':'auto'},'自动识别（推荐）'),
       E('option',{'value':'global'},'默认流量比例'),
@@ -1377,7 +1400,7 @@ return view.extend({
         ev.preventDefault();
         if(wpUnifiedActionBusy)return;
         wpUnifiedActionBusy=true;wpUnifiedActionButton.disabled=true;
-        wpUnifiedActionStatus.textContent='正在核查设备、全局事务及后台版本…';
+        wpUnifiedProgress('check',8,'正在核查设备、全局事务及后台版本…');
         return Promise.all([
           fs.exec('/usr/libexec/wanpilot-safe',['status']),
           fs.exec('/usr/libexec/wanpilot-global-safe',['status']),
@@ -1437,7 +1460,7 @@ return view.extend({
               wpUnifiedActionStatus.textContent='目标已保存并复核通过，正在核查设备是否也存在未发布变更…';
               return (selected==='auto'?verifyDeviceCleanForGlobal():Promise.resolve()).then(function(){
                 wpUnifiedActionStatus.textContent='正在应用全局比例 '+a+'/'+b+' → '+c+'/'+d+' 并自动确认…';
-                return wpApplyAndConfirm('global');
+                return wpApplyAndConfirm('global',wpUnifiedProgress);
               }).then(function(){
                 wpUnifiedActionStatus.textContent='全局比例已保存、应用并确认生效：WAN '+c+'% / WAN1 '+d+'%。';
                 return Promise.all([wp71Refresh(),wp72UpdateGate(),refreshGlobalState(true),refreshPublishSummary()]);
@@ -1448,7 +1471,7 @@ return view.extend({
             var draft=Number(globalSlider.value);
             if(!Number.isInteger(draft)||draft<5||draft>95||draft%5!==0)
               throw Error('目标权重超出范围，未保存');
-            wpUnifiedActionStatus.textContent='正在核对并保存目标比例…';
+            wpUnifiedProgress('save',18,'正在核对并保存目标比例…');
             return readFreshTarget().then(function(fresh){
               if(fresh!==desiredWan){
                 desiredWan=fresh;refreshTargetSaveState();
@@ -1461,7 +1484,7 @@ return view.extend({
             }).then(function(actual){
               if(actual!==draft)throw Error('目标比例保存后复核不一致，禁止应用');
               desiredWan=draft;refreshTargetSaveState();
-              wpUnifiedActionStatus.textContent='目标已保存，正在重新检查安全事务与配置差异…';
+              wpUnifiedProgress('check',32,'目标已保存，正在重新检查安全事务与配置差异…');
               return freshGlobalPublish(draft);
             });
           }
@@ -1496,7 +1519,7 @@ return view.extend({
                   wp71StatusValue(again[2].stdout,'verdict')!=='idle')
                   throw Error('设备预检后事务状态已变化，已取消应用');
                 wpUnifiedActionStatus.textContent='设备规则已复核，正在应用并自动确认…';
-                return wpApplyAndConfirm('device').then(function(){
+                return wpApplyAndConfirm('device',wpUnifiedProgress).then(function(){
                   wpUnifiedActionStatus.textContent='设备线路已保存、应用并确认生效。';
                   return Promise.all([wp71Refresh(),wp72UpdateGate(),refreshSafety(),refreshPublishSummary()]);
                 });
@@ -1537,7 +1560,7 @@ return view.extend({
               var job=jobs[index];
               if(job.item.control.value!==job.choice)
                 throw Error('设备编辑内容发生变化，已保存 '+completed.length+' 台；未执行网络应用，请刷新核对');
-              wpUnifiedActionStatus.textContent='保存设备 '+(index+1)+' / '+jobs.length+'：'+job.ip;
+              wpUnifiedProgress('save',Math.min(30,12+Math.round((index+1)/jobs.length*18)),'保存设备 '+(index+1)+' / '+jobs.length+'：'+job.ip);
               return fs.exec('/usr/libexec/wanpilot',job.args).then(function(result){
                 if(result.code!==0)
                   throw Error('保存 '+job.ip+' 失败；已保存 '+completed.length+' 台（'+completed.join('、')+'），未执行网络应用：'+(result.stderr||result.stdout||result.code));
@@ -1585,7 +1608,7 @@ return view.extend({
             if(selected==='auto'&&globalChanged){
               return verifyDeviceCleanForGlobal().then(function(){
                 wpUnifiedActionStatus.textContent='设备规则无待发布变更；正在应用全局比例并自动确认…';
-                return wpApplyAndConfirm('global');
+                return wpApplyAndConfirm('global',wpUnifiedProgress);
               }).then(function(){
                 wpUnifiedActionStatus.textContent='全局比例已保存、应用并确认生效。';
                 return Promise.all([wp71Refresh(),wp72UpdateGate(),refreshGlobalState(true),refreshPublishSummary()]);
@@ -1593,25 +1616,30 @@ return view.extend({
             }
             if(selected==='global'&&!globalChanged){wpUnifiedActionStatus.textContent='全局比例已一致，未重新应用或重启网络。';return;}
             wpUnifiedActionStatus.textContent='检测到全局比例 '+a+'/'+b+' → '+c+'/'+d+'，正在应用并自动确认…';
-            return wpApplyAndConfirm('global').then(function(){
+            return wpApplyAndConfirm('global',wpUnifiedProgress).then(function(){
               wpUnifiedActionStatus.textContent='全局比例已保存、应用并确认生效。';
               return Promise.all([wp71Refresh(),wp72UpdateGate(),refreshGlobalState(true),refreshPublishSummary()]);
             });
           });
         }).catch(function(err){
-          wpUnifiedActionStatus.textContent='没有执行应用：'+String(err);
+          wpUnifiedProgress('error',Math.max(8,parseInt(wpApplyProgressPct.textContent,10)||8),'没有执行应用：'+String(err));
           ui.addNotification(null,E('p',{},String(err)),'danger');
         }).finally(function(){wpUnifiedActionBusy=false;wpUnifiedActionButton.disabled=false;});
       }
     },'保存并应用');
-    var wpUnifiedActionCard=E('div',{'class':'cbi-section wp122-save-card'},[
-      E('div',{'class':'wp122-save-copy'},[
-        E('h3',{},'保存并应用'),
-        E('p',{},'修改比例或设备线路后点击一次；无变化不会重复应用。'),
-        E('div',{'class':'wp122-save-status'},[wpUnifiedActionStatus])
+    var wpUnifiedActionCard=E('div',{'class':'cbi-section wp122-save-card','id':'wp125-save-card'},[
+      E('div',{'class':'wp125-save-head'},[
+        E('div',{},[E('h3',{},'保存并应用'),E('p',{},'一次完成保存、安全检查、应用和自动确认；无变化不会重复应用。')]),
+        E('div',{'class':'wp125-head-state'},[wpApplyProgressLabel,wpApplyProgressPct])
       ]),
-      E('div',{'class':'wp122-save-action'},[wpUnifiedActionButton])
+      E('div',{'class':'wp125-steps'},wpApplyStepNodes),
+      E('div',{'class':'wp125-progress-track','aria-label':'保存并应用进度'},[wpApplyProgressFill]),
+      E('div',{'class':'wp125-save-foot'},[
+        E('div',{'class':'wp122-save-status'},[wpUnifiedActionStatus]),
+        E('div',{'class':'wp122-save-action'},[wpUnifiedActionButton])
+      ])
     ]);
+    wpSetApplyProgress('idle',0,'待命');
     // Routine editing stays compact; keep protected confirm/rollback accessible.
     // Debug outputs are reparented to the diagnostics tab, without destroying their IDs.
     // Keep the already-wired slider in the routine page; move its old standalone
@@ -1872,10 +1900,23 @@ return view.extend({
         '@media(max-width:800px){.wp6-app .wp62-wizard{padding:12px!important}.wp6-app .wp62-wizard>div{padding:12px!important}}\n'),
 E('style',{},'/* V6.1 card-first UI; presentation only */\n'+
         '.wp6-app .wp61-device-tools{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin:12px 0 18px}\n'+
-        '.wp6-app .wp122-save-card{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:28px;padding:22px 24px!important}\n'+
-        '.wp6-app .wp122-save-card h3{margin:0 0 8px!important}\n'+
-        '.wp6-app .wp122-save-card p{margin:0 0 7px!important}\n'+
-        '.wp6-app .wp122-save-status{color:#475569;font-size:13px;line-height:1.55}\n'+
+        '.wp6-app .wp122-save-card{display:block;padding:20px 24px!important}\n'+
+        '.wp6-app .wp125-save-head{display:flex;align-items:flex-start;justify-content:space-between;gap:20px}\n'+
+        '.wp6-app .wp122-save-card h3{margin:0 0 5px!important;font-size:18px}\n'+
+        '.wp6-app .wp122-save-card p{margin:0!important;color:#64748b;font-size:13px}\n'+
+        '.wp6-app .wp125-head-state{display:flex;align-items:center;gap:10px;white-space:nowrap;font-size:12px;color:#475569}\n'+
+        '.wp6-app .wp125-progress-pct{min-width:44px;text-align:center;padding:4px 8px;border-radius:999px;background:#eef2ff;color:#4457c7;font-weight:700}\n'+
+        '.wp6-app .wp125-steps{display:grid;grid-template-columns:repeat(4,1fr);gap:0;margin:18px 0 9px}\n'+
+        '.wp6-app .wp125-step{position:relative;display:flex;align-items:center;gap:7px;color:#94a3b8;font-size:12px;font-weight:600;min-width:0}\n'+
+        '.wp6-app .wp125-step:not(:last-child):after{content:"";height:1px;background:#dbe3ee;position:absolute;left:calc(50% + 18px);right:10px;top:50%}\n'+
+        '.wp6-app .wp125-step-dot{width:9px;height:9px;border-radius:50%;background:#cbd5e1;box-shadow:0 0 0 4px #f8fafc;flex:0 0 auto}\n'+
+        '.wp6-app .wp125-step.is-active{color:#334155}.wp6-app .wp125-step.is-active .wp125-step-dot{background:#5b70e8}\n'+
+        '.wp6-app .wp125-step.is-done{color:#334155}.wp6-app .wp125-step.is-done .wp125-step-dot{background:#16a34a}\n'+
+        '.wp6-app .wp125-progress-track{height:7px;border-radius:999px;background:#e8edf4;overflow:hidden}\n'+
+        '.wp6-app .wp125-progress-fill{height:100%;border-radius:999px;background:linear-gradient(90deg,#5b70e8,#7c6ce7);transition:width .28s ease}\n'+
+        '.wp6-app .wp122-save-card.is-done .wp125-progress-fill{background:#16a34a}.wp6-app .wp122-save-card.is-error .wp125-progress-fill{background:#dc2626}\n'+
+        '.wp6-app .wp125-save-foot{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:20px;margin-top:12px}\n'+
+        '.wp6-app .wp122-save-status{color:#475569;font-size:13px;line-height:1.45;min-width:0}\n'+
         '.wp6-app .wp122-save-action{display:flex;align-items:center;justify-content:flex-end}\n'+
         '.wp6-app .wp122-save-action .btn{min-width:132px;min-height:42px}\n'+
         '.wp6-app .wp61-device-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}\n'+
@@ -1897,7 +1938,7 @@ E('style',{},'/* V6.1 card-first UI; presentation only */\n'+
         '.wp6-app .wp61-help{margin-top:16px;padding:10px 14px;border:1px solid #e2e8f0}\n'+
         '.wp6-app [data-wp-tab=balanced] input[type=range]{max-width:100%!important;width:100%!important;accent-color:#586de5}\n'+
         '.wp6-app [data-wp-tab=safety] .wp6-heading{margin-bottom:8px}\n'+
-        '@media(max-width:900px){.wp6-app .wp61-device-grid{grid-template-columns:1fr}.wp6-app .wp122-save-card{grid-template-columns:1fr;gap:14px}.wp6-app .wp122-save-action{justify-content:flex-start}}\n'+
+        '@media(max-width:900px){.wp6-app .wp61-device-grid{grid-template-columns:1fr}.wp6-app .wp125-save-head,.wp6-app .wp125-save-foot{grid-template-columns:1fr;display:grid}.wp6-app .wp125-head-state{justify-content:flex-start}.wp6-app .wp122-save-action{justify-content:flex-start}.wp6-app .wp125-steps{grid-template-columns:repeat(2,1fr);gap:10px}.wp6-app .wp125-step:after{display:none}}\n'+
         '@media(max-width:480px){.wp6-app .wp61-device-summary{flex-wrap:wrap}.wp6-app .wp61-route{max-width:none;text-align:left}.wp6-app .wp61-status{margin-left:auto}}'),
       E('div',{'class':'wp6-header'},[
         E('div',{},[E('div',{'class':'wp6-brand'},'WanPilot'),E('div',{'class':'wp6-subtitle'},'双 WAN 管理 · 1.2.2')]),

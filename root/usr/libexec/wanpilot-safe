@@ -32,8 +32,12 @@ check_tools() {
  [ -z "$(uci -q changes wanpilot)" ] || die 'Pending WanPilot UCI edits'
  [ ! -f /etc/wanpilot/pending ] || die 'Legacy WanPilot change pending'
  [ ! -e /etc/wanpilot/global-safe-v19/pending ] || die 'Global balanced application pending'
+ # Existing managed sections are checked by the isolated stager; no blanket refusal.
 }
+# Revalidate candidate preservation at BOTH check and apply time.
+# All UCI reads are confined to independent directories and isolated delta paths.
 verify_preserved() {
+ # Clear every derived view, including the count-check view, before each validation.
  rm -rf "$BASE/verify-original" "$BASE/verify-candidate" "$BASE/config" "$BASE/delta"
  mkdir -p "$BASE/verify-original/config" "$BASE/verify-original/delta" "$BASE/verify-candidate/config" "$BASE/verify-candidate/delta" "$BASE/config" "$BASE/delta"
  cp "$CANDIDATE" "$BASE/config/mwan3"
@@ -46,6 +50,7 @@ verify_preserved() {
  command uci -c "$BASE/verify-candidate/config" -P "$BASE/verify-candidate/delta" show mwan3 |
    sed '/^mwan3\.wpx_[abpr]_[A-Za-z0-9_]*[.=]/d' | LC_ALL=C sort > "$BASE/verify-candidate.fields"
  cmp -s "$BASE/verify-original.fields" "$BASE/verify-candidate.fields" || die 'Candidate changes protected global or non-device fields'
+ # Catch missing/duplicate generated rule positions and invalid candidate policy wiring.
  command uci -c "$BASE/verify-candidate/config" -P "$BASE/verify-candidate/delta" show mwan3 > "$BASE/verify-candidate.all"
  awk -F'[.=]' '
    /^mwan3\.[A-Za-z0-9_]+=[A-Za-z0-9_]+$/ {
@@ -54,6 +59,8 @@ verify_preserved() {
    }
    END { if (!count || !default_position || last_rule >= default_position) exit 1 }
  ' "$BASE/verify-candidate.all" || die 'Candidate device rule order invalid'
+ # Validate every generated device rule references an existing policy, and
+ # each managed policy member actually exists and is a member section.
  awk -F'[.=]' '
    /^mwan3\.[A-Za-z0-9_]+=[A-Za-z0-9_]+$/ { section[$2]=$3; next }
    /^mwan3\.wpx_r_[A-Za-z0-9_]+\.use_policy=/ {
@@ -85,6 +92,7 @@ check_candidate() {
  verify_preserved
  count="$(command uci -c "$BASE/config" -P "$BASE/delta" show mwan3 | grep -Ec '^mwan3\.wpx_r_[A-Za-z0-9_]+=rule$' || :)"
  [ "$count" -gt 0 ] || die 'No enabled managed rules: refuse no-op application'
+ # Fail closed when saved WanPilot device rules and persisted candidate disagree.
  [ -f /tmp/wanpilot-v10-stage/expected-rules.sorted ] || die 'Missing expected rule manifest'
  command uci -c "$BASE/config" -P "$BASE/delta" show mwan3 |
    sed -n 's/^mwan3\.\(wpx_r_[A-Za-z0-9_]*\)=rule$/\1/p' | LC_ALL=C sort > "$BASE/candidate-rules.sorted"
@@ -98,6 +106,7 @@ check() {
  check_tools
  "$STAGER" || die 'Candidate generation failed'
  [ -f "$STAGED" ] || die 'Staged candidate absent'
+ # Avoid creating a new test from a stale candidate if config changed during staging.
  live_before="$(sha "$LIVE")"
  source_before="$(sha "$SOURCE")"
  [ -f /tmp/wanpilot-v10-stage/original.uci ] || die 'Missing staged audit output'
@@ -111,6 +120,7 @@ check() {
  sha "$BACKUP" > "$BASE/original.sha"
  sha "$CANDIDATE" > "$BASE/candidate.sha"
  echo "$source_before" > "$SOURCE_SHA"
+ # Candidate view is always rebuilt by verify_preserved() on each check.
  check_candidate
  printf 'READY PASS: candidate and backup verified; %s enabled rules.\n' "$count"
  echo "Original SHA256: $(cat "$BASE/original.sha")"
@@ -119,6 +129,9 @@ check() {
  echo 'No mwan3 changes or service restarts.'
 }
 restore_locked() {
+ # Never overwrite changes made by another editor after candidate activation.
+ # A matching original means restoration already happened and is harmless.
+ # A candidate mismatch means automatic recovery would destroy unrelated data.
  current_live_sha="$(sha "$LIVE")" || { echo restore_failed_live_read > "$STATE"; return 1; }
  if [ "$current_live_sha" != "$(cat "$BASE/candidate.sha" 2>/dev/null)" ] &&
     [ "$current_live_sha" != "$(cat "$BASE/original.sha" 2>/dev/null)" ]; then
@@ -133,6 +146,8 @@ restore_locked() {
     echo 'RESTORE BLOCKED: active mwan3 UCI edits; refusing to replace config while editor has pending changes' >> "$LOG"
     return 1
  fi
+ # If the original file is already back, a repeated watchdog/rollback must not
+ # restart WAN again. The transaction can be closed without touching the network.
  if [ "$current_live_sha" = "$(cat "$BASE/original.sha")" ]; then
     rm -f "$GUARD" "$TOKEN"
     echo restored > "$STATE"
@@ -142,6 +157,7 @@ restore_locked() {
  cp "$BACKUP" "$LIVE.recover.$$" || { echo restore_failed_copy > "$STATE"; return 1; }
  chmod 600 "$LIVE.recover.$$"
  mv "$LIVE.recover.$$" "$LIVE" || { echo restore_failed_move > "$STATE"; return 1; }
+ # Never revert the user's whole UCI staging area: a concurrent editor may own it.
  result=0
  /etc/init.d/mwan3 restart >> "$LOG" 2>&1 || result=1
  [ "$(sha "$LIVE")" = "$(cat "$BASE/original.sha")" ] || result=1
@@ -167,6 +183,7 @@ watchdog() {
  ) 8>"$SHARED_LOCK" 9>"$LOCK"
 }
 apply() {
+ # Real apply must have an actual candidate change; no-op must not restart WAN.
  locked
  [ ! -f "$GUARD" ] || die 'Application pending'
  [ ! -e /etc/wanpilot/global-safe-v19/pending ] || die 'Global application pending'
@@ -189,6 +206,9 @@ apply() {
    i=$((i+1)); sleep 1
  done
  if [ "$ok" -ne 1 ]; then rm -f "$GUARD" "$TOKEN"; echo arming_failed > "$STATE"; die 'Watchdog not ready; live config unchanged'; fi
+ # Recheck that WAN config was not altered while waiting for watchdog.
+ # Before any candidate write, cancel rather than schedule a restore that could
+ # overwrite a concurrent edit made while the watchdog was being armed.
  if [ "$(sha "$LIVE")" != "$(cat "$BASE/original.sha")" ]; then
    rm -f "$GUARD" "$TOKEN"
    echo arming_cancelled_live_changed > "$STATE"
@@ -199,6 +219,8 @@ apply() {
    echo arming_cancelled_source_changed > "$STATE"
    die 'WanPilot rules changed during watchdog arming; no live write'
  fi
+ # A different UCI editor is not governed by WanPilot's shared flock.
+ # Abort BEFORE any write instead of allowing the watchdog to overwrite it later.
  if [ -n "$(uci -q changes mwan3)" ] || [ -n "$(uci -q changes wanpilot)" ]; then
    rm -f "$GUARD" "$TOKEN"
    echo arming_cancelled_uci_edits > "$STATE"

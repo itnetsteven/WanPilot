@@ -1,4 +1,5 @@
 #!/bin/sh
+# Read-only UI status adapter. The tested wanpilot-safe engine is not modified.
 set -e
 BASE=/etc/wanpilot/v11
 /usr/libexec/wanpilot-safe status

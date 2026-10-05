@@ -12,6 +12,7 @@ ORIGINAL=/etc/config/mwan3
 [ ! -e /etc/wanpilot/pending ] || { echo 'ERROR: existing application pending'; exit 1; }
 [ ! -e /etc/wanpilot/v11/pending ] || { echo 'ERROR: device application pending'; exit 1; }
 [ ! -e /etc/wanpilot/global-safe-v19/pending ] || { echo 'ERROR: global application pending'; exit 1; }
+# Existing managed sections are validated and replaced ONLY in isolated staging below.
 [ ! -L "$BASE" ] || { echo "ERROR: stage directory is symlink"; exit 1; }
 mkdir -p "$BASE" "$BASE/orig-delta"
 rm -f "$BASE/orig-delta/mwan3"
@@ -27,6 +28,7 @@ pre_sha="$(sha256sum "$ORIGINAL" | awk '{print $1}')"
 source_sha="$(sha256sum /etc/config/wanpilot | awk '{print $1}')"
 real_changes_before="$(command uci -q changes mwan3)"
 [ -z "$real_changes_before" ] || { echo 'ERROR: live UCI delta not clean before staging' >&2; exit 1; } 
+# Every UCI mutation below is redirected into the isolated candidate directory.
 uci() { command uci -c "$STAGE" -P "$DELTA" "$@"; }
 : "${IPKG_INSTROOT:=}"
 export IPKG_INSTROOT
@@ -62,12 +64,9 @@ check_rule() {
   case " $profiles " in *" $profile "*) :;; *) err 'missing referenced profile';; esac
   [ -n "$src$dst$port" ] || err 'empty match would match all traffic'
   case "$proto" in all|tcp|udp|tcpudp|icmp) :;; *) err 'invalid protocol';; esac
-  [ -z "$src" ] || printf '%s
-' "$src" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/(3[0-2]|[12]?[0-9]))?$' || err 'invalid src'
-  [ -z "$dst" ] || printf '%s
-' "$dst" | grep -Eq '^[0-9a-fA-F.:/]+$' || err 'invalid dst'
-  [ -z "$port" ] || { printf '%s
-' "$port" | grep -Eq '^[0-9,:-]+$' || err 'invalid port'; }
+  [ -z "$src" ] || printf '%s\n' "$src" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}(/(3[0-2]|[12]?[0-9]))?$' || err 'invalid src'
+  [ -z "$dst" ] || printf '%s\n' "$dst" | grep -Eq '^[0-9a-fA-F.:/]+$' || err 'invalid dst'
+  [ -z "$port" ] || { printf '%s\n' "$port" | grep -Eq '^[0-9,:-]+$' || err 'invalid port'; }
   [ -z "$port" ] || { case "$proto" in tcp|udp|tcpudp) :;; *) err 'port requires TCP/UDP';; esac; }
 }
 make_profile() {
@@ -98,11 +97,14 @@ make_rule() {
   uci set "mwan3.$id.proto=$proto"
   generated="$generated $id"
 }
+# Load original plugin config without altering it.
 config_load wanpilot
 profiles=''; rules_seen=''; generated=''
 config_foreach check_profile profile
 [ -n "$profiles" ] || err 'no profiles'
 config_foreach check_rule rule
+# Collect the exact section IDs this WanPilot config is allowed to regenerate.
+# Any unrecognized managed section causes a safe stop, rather than silent deletion.
 allowed=''
 allow_profile() {
   config_get n "$1" name ''
@@ -116,22 +118,28 @@ allow_rule() {
 }
 config_foreach allow_profile profile
 config_foreach allow_rule rule
+# Only device-managed sections may be replaced. wpx_global_* MUST survive.
 old_sections="$(uci show mwan3 | sed -n 's/^mwan3\.\(wpx_[A-Za-z0-9_]*\)=[a-z]*$/\1/p')"
 for section in $old_sections; do
   case "$section" in
     wpx_global_*) continue ;;
     wpx_r_*)
+      # A device rule removed from the desired WanPilot config remains in live mwan3
+      # until the isolated candidate is applied. Only accept plugin-owned rules.
       [ "$(uci -q get "mwan3.$section")" = rule ] || err "unexpected managed type $section"
       old_policy="$(uci -q get "mwan3.$section.use_policy" || :)"
       case "$old_policy" in wpx_p_*) :;; *) err "unrecognized rule policy for $section";; esac
       uci delete "mwan3.$section" ;;
     wpx_p_*)
+      # Obsolete plugin-owned policy can remain after its profile is removed.
       [ "$(uci -q get "mwan3.$section")" = policy ] || err "unexpected managed type $section"
+      # Only retire a policy whose members are also in the WanPilot namespace.
       for member in $(uci -q get "mwan3.$section.use_member" || :); do
         case "$member" in wpx_a_*|wpx_b_*) :;; *) err "unrecognized member in $section";; esac
       done
       uci delete "mwan3.$section" ;;
     wpx_a_*|wpx_b_*)
+      # Permit orphaned members of a retired WanPilot profile in the candidate.
       [ "$(uci -q get "mwan3.$section")" = member ] || err "unexpected managed type $section"
       profile_name="${section#wpx_?_}"
       old_policy="wpx_p_$profile_name"
@@ -150,11 +158,15 @@ for section in $old_sections; do
 done
 config_foreach make_profile profile
 config_foreach make_rule rule
+# Reorder added user rules ahead of catch-all, preserving their relative order.
 for id in $generated; do
   position="$(uci -q show mwan3 | awk -F'[.=]' -v target=default_rule_v4 '/^mwan3\.[A-Za-z0-9_]+=[A-Za-z0-9_]+$/ {if ($2==target){print n;exit} n++}')"
   [ -n "$position" ] || err 'missing default IPv4 rule'
   uci reorder "mwan3.$id=$position"
 done
+# libuci on some OpenWrt builds leaves changes in -P DELTA after commit.
+# Never trust the result of commit alone: export the effective isolated view,
+# reload it using a *new*, empty delta directory, and compare all UCI fields.
 uci show mwan3 > "$BASE/expected-effective.uci"
 uci export mwan3 > "$BASE/exported.uci" || err 'isolated UCI export failed'
 sed '/^package mwan3$/d' "$BASE/exported.uci" > "$BASE/candidate.persisted.new"
@@ -164,30 +176,41 @@ cp "$BASE/candidate.persisted.new" "$BASE/verify-persisted/config/mwan3"
 command uci -c "$BASE/verify-persisted/config" -P "$BASE/verify-persisted/delta" show mwan3 > "$BASE/reloaded.uci" || err 'exported candidate cannot be reloaded'
 cmp -s "$BASE/expected-effective.uci" "$BASE/reloaded.uci" || err 'candidate persistence mismatch: overlay differs from reloaded file'
 [ -z "$(command uci -c "$BASE/verify-persisted/config" -P "$BASE/verify-persisted/delta" -q changes mwan3)" ] || err 'persisted candidate has pending delta'
+# Preserve original byte-for-byte on true no-op; otherwise install candidate
+# into STAGE only. This never writes /etc/config or the live UCI delta.
 command uci -c "$BASE/original-config" -P "$BASE/orig-delta" show mwan3 > "$BASE/original-effective.uci"
 if cmp -s "$BASE/original-effective.uci" "$BASE/reloaded.uci"; then
   cp "$ORIGINAL" "$STAGE/mwan3"
 else
   mv "$BASE/candidate.persisted.new" "$STAGE/mwan3"
 fi
+# Downstream validation must use persisted candidate rather than overlay.
 uci() { command uci -c "$BASE/verify-persisted/config" -P "$BASE/verify-persisted/delta" "$@"; }
+# Verify exact preservation of every old UCI option. No silent deletions or rewrites.
 command uci -c "$BASE/original-config" -P "$BASE/orig-delta" show mwan3 > "$BASE/original.uci"
 uci show mwan3 > "$BASE/candidate.uci"
+# Preserve all non-device-managed fields, notably balanced and wpx_global_*.
+# Device-managed sections are explicitly regenerated from WanPilot config.
+# Check the preserved subset in BOTH directions: no unexpected additions or deletions.
+# All sections other than device-controlled wpx_{a,b,p,r}_ remain bytewise
+# equivalent as UCI field lines, including global weights and default policy.
 sed '/^mwan3\.wpx_[abpr]_[A-Za-z0-9_]*[.=]/d' "$BASE/original.uci" | LC_ALL=C sort > "$BASE/original.preserved"
 sed '/^mwan3\.wpx_[abpr]_[A-Za-z0-9_]*[.=]/d' "$BASE/candidate.uci" | LC_ALL=C sort > "$BASE/candidate.preserved"
 cmp -s "$BASE/original.preserved" "$BASE/candidate.preserved" || err 'preserved UCI fields differ'
+# Check all generated rule sections precede the original catch-all.
 for id in $generated; do
   rulepos="$(uci show mwan3 | awk -F'[.=]' -v target="$id" '/^mwan3\.[A-Za-z0-9_]+=[A-Za-z0-9_]+$/ {if ($2==target){print n;exit} n++}')"
   defaultpos="$(uci show mwan3 | awk -F'[.=]' '/^mwan3\.[A-Za-z0-9_]+=[A-Za-z0-9_]+$/ {if ($2=="default_rule_v4"){print n;exit} n++}')"
   [ -n "$rulepos" ] && [ -n "$defaultpos" ] && [ "$rulepos" -lt "$defaultpos" ] || err "bad priority for $id"
 done
+# Compare generated rule ID set against persisted candidate ID set.
 : > "$BASE/expected-rules"
-for id in $generated; do printf '%s
-' "$id" >> "$BASE/expected-rules"; done
+for id in $generated; do printf '%s\n' "$id" >> "$BASE/expected-rules"; done
 sed -n 's/^mwan3\.\(wpx_r_[A-Za-z0-9_]*\)=rule$/\1/p' "$BASE/candidate.uci" > "$BASE/actual-rules"
 LC_ALL=C sort "$BASE/expected-rules" > "$BASE/expected-rules.sorted"
 LC_ALL=C sort "$BASE/actual-rules" > "$BASE/actual-rules.sorted"
 cmp -s "$BASE/expected-rules.sorted" "$BASE/actual-rules.sorted" || err 'generated device rules do not match persisted candidate'
+# Independently reload the final candidate path and reject stale delta views.
 mkdir -p "$BASE/final-check-delta"
 command uci -c "$STAGE" -P "$BASE/final-check-delta" show mwan3 > "$BASE/final-check.uci" || err 'final candidate cannot be reloaded'
 cmp -s "$BASE/reloaded.uci" "$BASE/final-check.uci" || err 'final candidate differs from generated effective UCI view'
