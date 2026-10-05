@@ -1,0 +1,31 @@
+#!/bin/sh
+# V1.6 safe weight saver: only commits /etc/config/wanpilot.
+set -e
+[ "${1:-}" = save ] || { echo 'ERROR: invalid operation' >&2; exit 2; }
+pct="${2:-}"
+case "$pct" in ''|*[!0-9]*) echo 'ERROR: percentage must be an integer' >&2; exit 2;; esac
+[ "$pct" -ge 5 ] && [ "$pct" -le 95 ] && [ $((pct % 5)) -eq 0 ] || { echo 'ERROR: percentage must be 5..95 in steps of 5' >&2; exit 2; }
+[ ! -e /etc/wanpilot/v11/pending ] || { echo 'ERROR: safe application pending' >&2; exit 1; }
+[ -z "$(uci -q changes wanpilot)" ] || { echo 'ERROR: unsaved UCI changes; save the form first' >&2; exit 1; }
+idx=0; found=''
+while [ "$idx" -lt 128 ]; do
+  name="$(uci -q get "wanpilot.@profile[$idx].name" 2>/dev/null)" || break
+  if [ "$name" = dualwan ]; then
+    [ -z "$found" ] || { echo 'ERROR: duplicate dualwan profiles' >&2; exit 1; }
+    found="$idx"
+  fi
+  idx=$((idx+1))
+done
+[ -n "$found" ] || { echo 'ERROR: dualwan profile missing' >&2; exit 1; }
+base="wanpilot.@profile[$found]"
+[ "$(uci -q get "$base.mode")" = balance ] || { echo 'ERROR: dualwan is not balance' >&2; exit 1; }
+[ "$(uci -q get "$base.primary")" = wan ] || { echo 'ERROR: primary WAN mismatch' >&2; exit 1; }
+[ "$(uci -q get "$base.secondary")" = wan1 ] || { echo 'ERROR: secondary WAN mismatch' >&2; exit 1; }
+mkdir -p /etc/wanpilot/upgrade-backups
+cp /etc/config/wanpilot /etc/wanpilot/upgrade-backups/wanpilot-weight-$(date +%Y%m%d-%H%M%S).bak
+uci set "$base.weight_primary=$pct"
+uci set "$base.weight_secondary=$((100-pct))"
+uci commit wanpilot
+[ "$(uci -q get "$base.weight_primary")" = "$pct" ] || exit 1
+[ "$(uci -q get "$base.weight_secondary")" = "$((100-pct))" ] || exit 1
+echo "SAVED: dualwan WAN=$pct WAN1=$((100-pct)); mwan3 unchanged"
