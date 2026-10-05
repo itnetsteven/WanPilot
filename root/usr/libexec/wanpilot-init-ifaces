@@ -1,0 +1,38 @@
+#!/bin/sh
+set -e
+: "${IPKG_INSTROOT:=}"
+[ -n "$IPKG_INSTROOT" ] && exit 0
+p="$(uci -q get wanpilot.dualwan.primary || :)"
+s="$(uci -q get wanpilot.dualwan.secondary || :)"
+if [ -n "$p" ] && [ -n "$s" ] && [ "$p" != "$s" ] &&    [ "$(uci -q get mwan3.$p)" = interface ] && [ "$(uci -q get mwan3.$s)" = interface ]; then
+  echo "WanPilot: keeping configured WAN interfaces: $p + $s"
+  exit 0
+fi
+list=''
+for i in $(uci -q show mwan3 | sed -n 's/^mwan3\.\([A-Za-z0-9_]*\)=interface$/\1/p'); do
+  enabled="$(uci -q get mwan3.$i.enabled || echo 1)"
+  [ "$enabled" = 0 ] && continue
+  case "$i" in lan|loopback|tailscale*|wg*|vpn*|tun*|docker*|br-*|guest*) continue;; esac
+  [ -n "$(uci -q get network.$i.proto || :)" ] || continue
+  list="$list $i"
+done
+set -- $list
+[ "$#" -ge 2 ] || { echo 'WanPilot: fewer than two reliable mwan3 WAN candidates; leaving interface selection unchanged.'; exit 0; }
+primary=''; secondary=''
+for i in "$@"; do [ "$i" = wan ] && primary="$i"; done
+[ -n "$primary" ] || primary="$1"
+for i in "$@"; do
+  [ "$i" = "$primary" ] && continue
+  case "$i" in wan1|wan2|wanb) secondary="$i"; break;; esac
+done
+if [ -z "$secondary" ]; then for i in "$@"; do [ "$i" = "$primary" ] || { secondary="$i"; break; }; done; fi
+[ -n "$primary" ] && [ -n "$secondary" ] && [ "$primary" != "$secondary" ] || { echo 'WanPilot: WAN detection ambiguous; no changes made.'; exit 0; }
+uci -q set wanpilot.dualwan=profile
+uci -q set wanpilot.dualwan.name=dualwan
+uci -q set wanpilot.dualwan.mode=balance
+uci -q set "wanpilot.dualwan.primary=$primary"
+uci -q set "wanpilot.dualwan.secondary=$secondary"
+uci -q set wanpilot.dualwan.weight_primary="$(uci -q get wanpilot.dualwan.weight_primary || echo 1)"
+uci -q set wanpilot.dualwan.weight_secondary="$(uci -q get wanpilot.dualwan.weight_secondary || echo 1)"
+uci -q commit wanpilot
+echo "WanPilot: detected WAN interfaces: $primary + $secondary"
